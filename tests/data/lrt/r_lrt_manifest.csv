@@ -1,0 +1,5 @@
+fixture,full,reduced,contrast,lrt_df,seed,outlier_count
+r_lrt_single_factor.csv,~ condition,~ 1,condition: B vs A,1,1001,NA
+r_lrt_multi_factor.csv,~ group + condition,~ group,condition: B vs A,1,1002,NA
+r_lrt_multilevel.csv,~ condition3,~ 1,condition3: B vs A,2,1003,NA
+r_lrt_outlier.csv,~ condition,~ 1,condition: B vs A,1,1004,200
