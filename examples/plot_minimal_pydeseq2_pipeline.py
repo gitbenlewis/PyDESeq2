@@ -382,6 +382,63 @@ ds_Y_vs_X = DeseqStats(dds, contrast=["group", "Y", "X"], inference=inference)
 ds_Y_vs_X.summary()
 
 # %%
+# Likelihood-ratio test
+# ^^^^^^^^^^^^^^^^^^^^^
+#
+# Wald tests answer a question about a selected coefficient or contrast. A classical
+# likelihood-ratio test (LRT) instead compares the fitted full model with a nested
+# reduced model. Here, the full design is ``~group + condition`` and the reduced
+# design is ``~group``, so the LRT asks whether adding ``condition`` improves
+# the fit after accounting for ``group``.
+#
+# An LRT can be selected when constructing :class:`DeseqStats`. The existing
+# :class:`DeseqDataSet <pydeseq2.dds.DeseqDataSet>` already contains the fitted
+# full model.
+
+ds_lrt = DeseqStats(
+    dds,
+    contrast=["condition", "B", "A"],
+    test="LRT",
+    reduced="~group",
+    inference=inference,
+)
+ds_lrt.summary()
+
+# %%
+# For an LRT, ``stat``, ``pvalue``, and ``padj`` in ``results_df`` describe the
+# omnibus full-versus-reduced comparison. The ``contrast`` above only selects which
+# log fold change and standard error are reported; it does not change the LRT statistic
+# or p-value. This distinction is especially important when the full model adds a
+# factor with more than two levels, because the LRT jointly tests all added
+# coefficients.
+#
+# The test can equivalently be selected at the
+# :meth:`~pydeseq2.dds.DeseqDataSet.deseq2` entry point:
+#
+# .. code-block:: python
+#
+#    lrt_dds = DeseqDataSet(
+#        counts=counts_df,
+#        metadata=metadata,
+#        design="~group + condition",
+#        refit_cooks=True,
+#        inference=inference,
+#    )
+#    lrt_dds.deseq2(test="LRT", reduced="~group")
+#    lrt_ds = DeseqStats(
+#        lrt_dds,
+#        contrast=["condition", "B", "A"],
+#        inference=inference,
+#    )
+#    lrt_ds.summary()
+#
+# In both forms, ``reduced`` is required, must be nested in the full design, and must
+# contain fewer coefficients. PyDESeq2 currently implements the classical
+# negative-binomial LRT with a chi-square reference distribution. Quasi-likelihood
+# variants are not included. The Wald-only ``lfc_null``, ``alt_hypothesis``,
+# and ``prior_LFC_var`` options cannot be used with an LRT.
+
+# %%
 # LFC shrinkage (multifactor)
 # """""""""""""""""""""""""""
 #

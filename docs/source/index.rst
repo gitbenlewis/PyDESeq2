@@ -14,11 +14,17 @@ It aims to facilitate DEA experiments for python users.
 As PyDESeq2 is a re-implementation of `DESeq2 <https://bioconductor.org/packages/release/bioc/html/DESeq2.html>`_
 from scratch, you may experience some differences in terms of retrieved values or available features.
 
-Currently, available features broadly correspond to the default settings of DESeq2 (v1.34.0) for single-factor and
-multi-factor analysis (with categorical or continuous factors) using Wald tests, with an
-optional `apeGLM <https://academic.oup.com/bioinformatics/article/35/12/2084/5159452>`_ LFC shrinkage step
-:cite:p:`zhu2019heavy`. We plan to implement more in the near future. In case there is a feature you would particularly
-like to be implemented, feel free to open an issue on GitHub.
+Currently, available features broadly correspond to the default settings of DESeq2
+(v1.34.0) for single-factor and multi-factor analysis (with categorical or
+continuous factors). Hypothesis testing supports Wald tests and classical
+negative-binomial likelihood-ratio tests (LRTs) comparing nested full and reduced
+designs with a chi-square reference distribution. Quasi-likelihood and
+`glmGamPoi <https://bioconductor.org/packages/release/bioc/html/glmGamPoi.html>`_
+variants are not currently supported. An optional
+`apeGLM <https://academic.oup.com/bioinformatics/article/35/12/2084/5159452>`_
+LFC shrinkage step is available :cite:p:`zhu2019heavy`. We plan to implement more
+in the near future. If there is a feature you would particularly like to be
+implemented, feel free to open an issue on GitHub.
 
 
 Citing this work
