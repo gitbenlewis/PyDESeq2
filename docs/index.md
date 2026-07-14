@@ -4,7 +4,8 @@ PyDESeq2 is a Python implementation of the [DESeq2](https://bioconductor.org/pac
 It works on {class}`~anndata.AnnData` objects and is part of the [scverse ecosystem](https://scverse.org).
 
 Because PyDESeq2 is a reimplementation from scratch, you may see differences in retrieved values or available features.
-Current features broadly correspond to the default settings of DESeq2 (v1.34.0) for single-factor and multi-factor analysis, with categorical or continuous factors, using Wald tests, plus an optional [apeGLM](https://academic.oup.com/bioinformatics/article/35/12/2084/5159452) log fold-change shrinkage step {cite:p}`zhu2019heavy`.
+Current features broadly correspond to the default settings of DESeq2 (v1.34.0) for single-factor and multi-factor analysis, with categorical or continuous factors, using Wald tests or classical negative-binomial likelihood-ratio tests (LRTs) comparing nested full and reduced designs with a chi-square reference distribution, plus an optional [apeGLM](https://academic.oup.com/bioinformatics/article/35/12/2084/5159452) log fold-change shrinkage step {cite:p}`zhu2019heavy`.
+Quasi-likelihood and [glmGamPoi](https://bioconductor.org/packages/release/bioc/html/glmGamPoi.html) variants are not currently supported.
 If there is a feature you would like to see, open an issue on GitHub.
 
 ::::{grid} 1 2 2 3
