@@ -437,6 +437,13 @@ ds_lrt.summary()
 # negative-binomial LRT with a chi-square reference distribution. Quasi-likelihood
 # variants are not included. The Wald-only ``lfc_null``, ``alt_hypothesis``,
 # and ``prior_LFC_var`` options cannot be used with an LRT.
+#
+# If Cook's outlier refitting replaces counts, PyDESeq2 retains the effective count
+# matrix in its internally managed ``dds.layers["replace_counts"]`` layer so the full
+# and reduced models use identical data. The ``"replace_counts"`` name is therefore
+# reserved for such a fit: a user-owned layer with that name causes replacement to
+# raise instead of being overwritten. Retaining this full matrix adds memory even
+# when ``low_memory=True``.
 
 # %%
 # LFC shrinkage (multifactor)

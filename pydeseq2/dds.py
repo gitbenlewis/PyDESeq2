@@ -1,8 +1,10 @@
+import hashlib
 import sys
 import time
 import warnings
-from typing import Any
+from collections.abc import Mapping
 from typing import Literal
+from typing import Protocol
 from typing import cast
 
 import anndata as ad  # type: ignore
@@ -70,6 +72,13 @@ _LRTResult = tuple[
     pd.Series,
     pd.DataFrame,
 ]
+
+
+class _LRTDigest(Protocol):
+    """Minimal structural type implemented by hashlib digest objects."""
+
+    def update(self, data: bytes | bytearray | memoryview, /) -> None:
+        """Add bytes to the digest state."""
 
 
 class DeseqDataSet(ad.AnnData):
@@ -794,20 +803,23 @@ class DeseqDataSet(ad.AnnData):
             columns=reduced_matrix.columns.copy(),
         )
 
-    def _clear_cooks_refit_state(self) -> None:
-        """Remove Cook-refit state before recomputing a complete model fit."""
-        var = cast(pd.DataFrame, self.var)
-        obs = cast(pd.DataFrame, self.obs)
-        for key in ("replaced", "refitted", "_pvalue_cooks_outlier"):
-            if key in var:
-                del var[key]
-        if "replaceable" in obs:
-            del obs["replaceable"]
-        if "replace_cooks" in self.layers:
-            del self.layers["replace_cooks"]
-        for attribute in ("counts_to_refit", "new_all_zeroes_genes"):
-            if hasattr(self, attribute):
-                delattr(self, attribute)
+    def _owns_replace_counts(self) -> bool:
+        """Return whether the replacement-count layer is managed by PyDESeq2."""
+        owner = self.uns.get(_REPLACE_COUNTS_OWNER_KEY, False)
+        return (
+            isinstance(owner, (bool, np.bool_))
+            and bool(owner)
+            and _REPLACE_COUNTS_LAYER in self.layers
+        )
+
+    def _discard_owned_replace_counts(self) -> None:
+        """Delete only an internally managed replacement-count layer."""
+        owner = self.uns.get(_REPLACE_COUNTS_OWNER_KEY, False)
+        if not isinstance(owner, (bool, np.bool_)) or not bool(owner):
+            return
+        if _REPLACE_COUNTS_LAYER in self.layers:
+            del self.layers[_REPLACE_COUNTS_LAYER]
+        del self.uns[_REPLACE_COUNTS_OWNER_KEY]
 
     @staticmethod
     def _validated_lrt_counts(values: object) -> np.ndarray:
@@ -828,59 +840,300 @@ class DeseqDataSet(ad.AnnData):
             raise ValueError(error)
         return np.ascontiguousarray(counts, dtype="<i8")
 
+    @staticmethod
+    def _update_lrt_array_digest(
+        digest: _LRTDigest,
+        label: str,
+        values: object,
+        kind: Literal["float", "int", "bool"],
+    ) -> None:
+        """Stream one canonical labeled LRT array into a digest."""
+        if kind == "float":
+            array = np.asarray(values, dtype="<f8")
+            array = np.ascontiguousarray(array)
+            if np.isnan(array).any():
+                array = array.copy()
+                array[np.isnan(array)] = np.nan
+        elif kind == "int":
+            array = DeseqDataSet._validated_lrt_counts(values)
+        else:
+            array = np.ascontiguousarray(np.asarray(values, dtype="<i1"))
+
+        encoded_label = label.encode("utf-8")
+        shape = np.asarray(array.shape, dtype="<i8").tobytes()
+        digest.update(len(encoded_label).to_bytes(8, "little"))
+        digest.update(encoded_label)
+        digest.update(len(shape).to_bytes(8, "little"))
+        digest.update(shape)
+        digest.update(memoryview(array).cast("B"))
+
+    @staticmethod
+    def _update_lrt_text_digest(
+        digest: _LRTDigest, label: str, values: list[str]
+    ) -> None:
+        """Stream unambiguous canonical labeled text into a digest."""
+        encoded_label = label.encode("utf-8")
+        digest.update(len(encoded_label).to_bytes(8, "little"))
+        digest.update(encoded_label)
+        digest.update(len(values).to_bytes(8, "little"))
+        for value in values:
+            encoded_value = value.encode("utf-8")
+            digest.update(len(encoded_value).to_bytes(8, "little"))
+            digest.update(encoded_value)
+
+    @staticmethod
+    def _lrt_nullable_bool_values(
+        values: pd.Series | np.ndarray,
+    ) -> np.ndarray:
+        """Encode nullable booleans as -1, 0, and 1 for stable hashing."""
+        return pd.array(values.tolist(), dtype="boolean").to_numpy(
+            dtype=np.int8,
+            na_value=-1,
+        )
+
+    def _lrt_input_digest(self, reduced_design: pd.DataFrame) -> str | None:
+        """Fingerprint every scientific input used by a prepared LRT."""
+        full_design = self.obsm.get("design_matrix")
+        full_lfcs = self.varm.get("LFC")
+        if not isinstance(full_design, pd.DataFrame) or not isinstance(
+            full_lfcs, pd.DataFrame
+        ):
+            return None
+        if "size_factors" not in self.obs or "dispersions" not in self.var:
+            return None
+        if "non_zero" not in self.var:
+            return None
+        if not pd.Index(full_design.index).equals(pd.Index(self.obs_names)):
+            return None
+        if not pd.Index(reduced_design.index).equals(pd.Index(self.obs_names)):
+            return None
+        if not pd.Index(full_lfcs.index).equals(pd.Index(self.var_names)):
+            return None
+        if [str(column) for column in full_lfcs.columns] != [
+            str(column) for column in full_design.columns
+        ]:
+            return None
+
+        digest = hashlib.sha256()
+        self._update_lrt_array_digest(
+            digest, "effective_counts", self._effective_counts(), "int"
+        )
+        self._update_lrt_array_digest(
+            digest,
+            "size_factors",
+            self.obs["size_factors"].to_numpy(dtype=float),
+            "float",
+        )
+        self._update_lrt_array_digest(
+            digest,
+            "dispersions",
+            self.var["dispersions"].to_numpy(dtype=float),
+            "float",
+        )
+        self._update_lrt_array_digest(
+            digest, "full_lfcs", full_lfcs.to_numpy(dtype=float), "float"
+        )
+        self._update_lrt_array_digest(
+            digest, "full_design", full_design.to_numpy(dtype=float), "float"
+        )
+        self._update_lrt_array_digest(
+            digest,
+            "reduced_design",
+            reduced_design.to_numpy(dtype=float),
+            "float",
+        )
+        self._update_lrt_array_digest(
+            digest,
+            "non_zero",
+            self.var["non_zero"].to_numpy(dtype=bool),
+            "bool",
+        )
+        self._update_lrt_array_digest(
+            digest, "replacement_owned", [self._owns_replace_counts()], "bool"
+        )
+        self._update_lrt_array_digest(
+            digest, "lrt_controls", [self.min_mu, self.beta_tol], "float"
+        )
+        self._update_lrt_text_digest(
+            digest,
+            "full_design_columns",
+            [str(column) for column in full_design.columns],
+        )
+        self._update_lrt_text_digest(
+            digest,
+            "full_lfc_columns",
+            [str(column) for column in full_lfcs.columns],
+        )
+        self._update_lrt_text_digest(
+            digest,
+            "reduced_design_columns",
+            [str(column) for column in reduced_design.columns],
+        )
+
+        if "replaced" in self.var:
+            self._update_lrt_array_digest(digest, "has_replaced", [True], "bool")
+            self._update_lrt_array_digest(
+                digest,
+                "replaced",
+                self.var["replaced"].to_numpy(dtype=bool),
+                "bool",
+            )
+        else:
+            self._update_lrt_array_digest(digest, "has_replaced", [False], "bool")
+
+        if "_LFC_converged" in self.var:
+            self._update_lrt_array_digest(digest, "has_lfc_converged", [True], "bool")
+            self._update_lrt_array_digest(
+                digest,
+                "lfc_converged",
+                self._lrt_nullable_bool_values(self.var["_LFC_converged"]),
+                "bool",
+            )
+        else:
+            self._update_lrt_array_digest(digest, "has_lfc_converged", [False], "bool")
+        return digest.hexdigest()
+
+    def _lrt_output_digest(self) -> str | None:
+        """Fingerprint every serialized output returned by a prepared LRT."""
+        if any(key not in self.var for key in _LRT_VAR_KEYS):
+            return None
+        full_lfcs = self.varm.get(_LRT_FULL_LFC_KEY)
+        full_design = self.obsm.get("design_matrix")
+        if not isinstance(full_lfcs, pd.DataFrame) or not isinstance(
+            full_design, pd.DataFrame
+        ):
+            return None
+        if not pd.Index(full_lfcs.index).equals(pd.Index(self.var_names)):
+            return None
+        if [str(column) for column in full_lfcs.columns] != [
+            str(column) for column in full_design.columns
+        ]:
+            return None
+
+        digest = hashlib.sha256()
+        self._update_lrt_array_digest(
+            digest, "statistics", self.var["_lrt_statistic"].to_numpy(), "float"
+        )
+        self._update_lrt_array_digest(
+            digest, "p_values", self.var["_lrt_pvalue"].to_numpy(), "float"
+        )
+        self._update_lrt_array_digest(
+            digest,
+            "full_deviance",
+            self.var["_lrt_full_deviance"].to_numpy(),
+            "float",
+        )
+        self._update_lrt_array_digest(
+            digest,
+            "reduced_converged",
+            self._lrt_nullable_bool_values(self.var["_lrt_reduced_converged"]),
+            "bool",
+        )
+        self._update_lrt_array_digest(
+            digest,
+            "full_converged",
+            self._lrt_nullable_bool_values(self.var["_lrt_full_converged"]),
+            "bool",
+        )
+        self._update_lrt_array_digest(
+            digest,
+            "new_all_zero",
+            self.var["_lrt_new_all_zero"].to_numpy(),
+            "bool",
+        )
+        self._update_lrt_array_digest(
+            digest,
+            "cached_full_lfcs",
+            full_lfcs.to_numpy(dtype=float),
+            "float",
+        )
+        self._update_lrt_text_digest(
+            digest,
+            "cached_full_lfc_columns",
+            [str(column) for column in full_lfcs.columns],
+        )
+        return digest.hexdigest()
+
     def _lrt_fit_state_matches(self) -> bool:
-        """Return whether cached LRT results align with the current dataset."""
+        """Return whether cached LRT provenance matches the current fitted state."""
         try:
-            metadata = self.uns["_lrt"]
-            if not isinstance(metadata, dict):
+            metadata_value = self.uns["_lrt"]
+            if not isinstance(metadata_value, Mapping):
                 return False
+            metadata = cast(Mapping[str, object], metadata_value)
             full_design = self.obsm["design_matrix"]
             reduced_design = self.obsm["_lrt_reduced_design_matrix"]
-            full_lfcs = self.varm[_LRT_FULL_LFC_KEY]
             if not isinstance(full_design, pd.DataFrame) or not isinstance(
                 reduced_design, pd.DataFrame
             ):
                 return False
-            if not isinstance(full_lfcs, pd.DataFrame):
+            if not pd.Index(full_design.index).equals(pd.Index(self.obs_names)):
                 return False
-            if any(key not in self.var for key in _LRT_VAR_KEYS):
+            if not pd.Index(reduced_design.index).equals(pd.Index(self.obs_names)):
                 return False
-            if not full_design.index.equals(self.obs_names):
-                return False
-            if not reduced_design.index.equals(self.obs_names):
-                return False
-            if not full_lfcs.index.equals(self.var_names):
-                return False
-            if list(full_lfcs.columns.astype(str)) != list(
-                full_design.columns.astype(str)
+
+            stored_generation = metadata.get("fit_generation")
+            current_generation = self.uns.get("_fit_generation", 0)
+            if isinstance(stored_generation, np.integer):
+                stored_generation = int(stored_generation)
+            if isinstance(current_generation, np.integer):
+                current_generation = int(current_generation)
+            if not isinstance(stored_generation, int) or not isinstance(
+                current_generation, int
             ):
                 return False
-            if int(metadata["df"]) != full_design.shape[1] - reduced_design.shape[1]:
+            if stored_generation != current_generation:
                 return False
-            if list(np.asarray(metadata["obs_names"], dtype=str)) != list(
-                self.obs_names.astype(str)
-            ):
+            if list(
+                np.atleast_1d(np.asarray(metadata.get("var_names", []), dtype=str))
+            ) != [str(name) for name in self.var_names]:
                 return False
-            if list(np.asarray(metadata["var_names"], dtype=str)) != list(
-                self.var_names.astype(str)
-            ):
+            if list(
+                np.atleast_1d(np.asarray(metadata.get("obs_names", []), dtype=str))
+            ) != [str(name) for name in self.obs_names]:
                 return False
-            if list(np.asarray(metadata["reduced_design_columns"], dtype=str)) != list(
-                reduced_design.columns.astype(str)
-            ):
+            if list(
+                np.atleast_1d(
+                    np.asarray(metadata.get("full_design_columns", []), dtype=str)
+                )
+            ) != [str(column) for column in full_design.columns]:
                 return False
-            stored_design = np.asarray(metadata["full_design_values"], dtype=float)
-            return stored_design.shape == full_design.shape and np.array_equal(
-                stored_design,
-                full_design.to_numpy(dtype=float),
-                equal_nan=True,
+
+            stored_values = np.asarray(
+                metadata.get("full_design_values", []), dtype=float
             )
-        except (AttributeError, KeyError, TypeError, ValueError):
+            current_values = np.asarray(full_design, dtype=float)
+            if stored_values.shape != current_values.shape or not np.array_equal(
+                stored_values,
+                current_values,
+                equal_nan=True,
+            ):
+                return False
+
+            input_digest = self._lrt_input_digest(reduced_design)
+            output_digest = self._lrt_output_digest()
+            return (
+                input_digest is not None
+                and output_digest is not None
+                and str(metadata.get("input_sha256", "")) == input_digest
+                and str(metadata.get("output_sha256", "")) == output_digest
+            )
+        except (AttributeError, KeyError, OverflowError, TypeError, ValueError):
             return False
 
     def _invalidate_lrt_cache(self, *, discard_replace_counts: bool = False) -> None:
         """Remove cached test results after changing fitted model state."""
         var = cast(pd.DataFrame, self.var)
+        has_cached_state = (
+            "_deseq2_test" in self.uns
+            or "_lrt" in self.uns
+            or "_lrt_reduced_design_matrix" in self.obsm
+            or any(key in var for key in _LRT_VAR_KEYS)
+            or _LRT_FULL_LFC_KEY in self.varm
+        )
+        if has_cached_state:
+            self.uns["_fit_generation"] = int(self.uns.get("_fit_generation", 0)) + 1
+
         if "_deseq2_test" in self.uns:
             del self.uns["_deseq2_test"]
         if "_lrt" in self.uns:
@@ -899,49 +1152,13 @@ class DeseqDataSet(ad.AnnData):
     def _effective_counts(self) -> np.ndarray:
         """Return the counts used for final inference, including Cook replacements."""
         counts = self.X
-        if _LRT_REPLACE_COUNTS_LAYER in self.layers:
-            counts = self.layers[_LRT_REPLACE_COUNTS_LAYER]
+        if self._owns_replace_counts():
+            counts = self.layers[_REPLACE_COUNTS_LAYER]
         if counts is None:
             raise RuntimeError("LRT requires a count matrix.")
         if hasattr(counts, "toarray"):
             counts = counts.toarray()
-        effective_counts = self._validated_lrt_counts(counts)
-
-        var = cast(pd.DataFrame, self.var)
-        if _LRT_REPLACE_COUNTS_LAYER in self.layers or "replaced" not in var:
-            return effective_counts
-        if not var["replaced"].any():
-            return effective_counts
-        if not hasattr(self, "counts_to_refit"):
-            raise RuntimeError(
-                "LRT requires the effective counts used during Cook outlier refitting, "
-                "but that state is unavailable. Rerun "
-                "dds.deseq2(test='LRT', reduced=...) before computing an LRT."
-            )
-
-        refit_counts = self.counts_to_refit.X
-        if hasattr(refit_counts, "toarray"):
-            refit_counts = refit_counts.toarray()
-        refit_positions = self.var_names.get_indexer(self.counts_to_refit.var_names)
-        if (
-            not self.counts_to_refit.obs_names.equals(self.obs_names)
-            or (refit_positions < 0).any()
-        ):
-            raise RuntimeError(
-                "Cook-refitted effective counts no longer align with this "
-                "DeseqDataSet. Rerun dds.deseq2(test='LRT', reduced=...)."
-            )
-        effective_counts = effective_counts.copy()
-        effective_counts[:, refit_positions] = self._validated_lrt_counts(refit_counts)
-        if hasattr(self, "new_all_zeroes_genes"):
-            all_zero_positions = self.var_names.get_indexer(self.new_all_zeroes_genes)
-            if (all_zero_positions < 0).any():
-                raise RuntimeError(
-                    "Cook-refitted all-zero genes no longer align with this "
-                    "DeseqDataSet. Rerun dds.deseq2(test='LRT', reduced=...)."
-                )
-            effective_counts[:, all_zero_positions] = 0
-        return effective_counts
+        return self._validated_lrt_counts(counts)
 
     def _compute_lrt(
         self,
@@ -964,23 +1181,33 @@ class DeseqDataSet(ad.AnnData):
         if "size_factors" not in self.obs:
             raise RuntimeError("LRT requires fitted size factors.")
         full_design_frame = self.obsm.get("design_matrix")
-        if not isinstance(full_design_frame, pd.DataFrame):
-            raise RuntimeError("LRT requires a DataFrame-backed full design.")
+        full_lfcs_value = self.varm.get("LFC")
+        if not isinstance(full_design_frame, pd.DataFrame) or not isinstance(
+            full_lfcs_value, pd.DataFrame
+        ):
+            raise RuntimeError("LRT requires DataFrame-backed designs and fitted LFCs.")
         var = cast(pd.DataFrame, self.var)
+        if (
+            "replaced" in var
+            and var["replaced"].fillna(False).astype(bool).any()
+            and not self._owns_replace_counts()
+        ):
+            raise RuntimeError(
+                "LRT requires the effective counts used during Cook outlier refitting, "
+                "but an internally managed replacement-count layer is unavailable. "
+                "Rerun dds.deseq2() before computing an LRT."
+            )
+
         counts = self._effective_counts()
         dispersions = var["dispersions"].to_numpy(dtype=float)
-        full_lfcs = pd.DataFrame(
-            np.nan,
-            index=self.var_names,
-            columns=full_design_frame.columns,
-        )
+        full_lfcs = full_lfcs_value.copy()
         effective_nonzero = (counts != 0).any(axis=0)
         fit_mask = effective_nonzero & np.isfinite(dispersions)
         fit_idx = np.flatnonzero(fit_mask)
         fit_positions = fit_idx.tolist()
 
         new_all_zero_values = np.zeros(self.n_vars, dtype=bool)
-        if "replaced" in var:
+        if self._owns_replace_counts() and "replaced" in var:
             new_all_zero_values = (
                 var["non_zero"].to_numpy(dtype=bool)
                 & var["replaced"].to_numpy(dtype=bool)
@@ -999,10 +1226,25 @@ class DeseqDataSet(ad.AnnData):
             pd.array([pd.NA] * self.n_vars, dtype="boolean"),
             index=self.var_names,
         )
-        full_converged = pd.Series(
-            pd.array([pd.NA] * self.n_vars, dtype="boolean"),
-            index=self.var_names,
-        )
+        if not refit_full and "_LFC_converged" in var:
+            full_converged = pd.Series(
+                pd.array(
+                    var["_LFC_converged"].to_numpy(),
+                    dtype="boolean",
+                ),
+                index=self.var_names,
+            )
+        else:
+            full_converged = pd.Series(
+                pd.array([pd.NA] * self.n_vars, dtype="boolean"),
+                index=self.var_names,
+            )
+        if refit_full:
+            full_lfcs = pd.DataFrame(
+                np.nan,
+                index=self.var_names,
+                columns=full_design_frame.columns,
+            )
         full_lfcs.loc[new_all_zero] = 0.0
         statistics.loc[new_all_zero] = 0.0
         p_values.loc[new_all_zero] = 1.0
@@ -1018,9 +1260,7 @@ class DeseqDataSet(ad.AnnData):
                 full_lfcs,
             )
 
-        normalization_factors = self._get_normalization_factors()
-        if normalization_factors.ndim == 2:
-            normalization_factors = normalization_factors[:, fit_idx]
+        size_factors = self.obs["size_factors"].to_numpy(dtype=float)
         full_design = full_design_frame.to_numpy(dtype=float)
         reduced_values = reduced_design.to_numpy(dtype=float)
         fit_inference = inference or self.inference
@@ -1120,6 +1360,22 @@ class DeseqDataSet(ad.AnnData):
                 RuntimeWarning,
                 stacklevel=2,
             )
+            materially_negative = materially_negative_mask(lrt_statistics)
+
+        full_status = full_converged.iloc[fit_idx]
+        full_failed = full_status.notna().to_numpy() & ~full_status.fillna(
+            True
+        ).to_numpy(dtype=bool)
+        if full_failed.any():
+            warnings.warn(
+                "The full-model fit did not converge for "
+                f"{int(full_failed.sum())} gene(s); inspect "
+                "'_lrt_full_converged' before interpreting those results.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        lrt_statistics[(lrt_statistics < 0) & ~materially_negative] = 0.0
         if materially_negative.any():
             warnings.warn(
                 f"{int(materially_negative.sum())} gene(s) had materially negative "
@@ -1136,9 +1392,7 @@ class DeseqDataSet(ad.AnnData):
         full_deviance_values = full_deviance.to_numpy(copy=True)
         statistic_values[fit_idx] = lrt_statistics
         p_value_values[fit_idx] = chi2.sf(lrt_statistics, df=degrees_of_freedom)
-        fitted_full_deviance = 2 * full_nll
-        fitted_full_deviance[nonfinite_likelihood] = np.nan
-        full_deviance_values[fit_idx] = fitted_full_deviance
+        full_deviance_values[fit_idx] = 2 * full_nll
         statistics = pd.Series(statistic_values, index=self.var_names, dtype=float)
         p_values = pd.Series(p_value_values, index=self.var_names, dtype=float)
         full_deviance = pd.Series(
@@ -1191,17 +1445,31 @@ class DeseqDataSet(ad.AnnData):
         self.var["_lrt_full_converged"] = full_converged.array
         self.var["_lrt_new_all_zero"] = new_all_zero.to_numpy(dtype=bool)
         self.varm[_LRT_FULL_LFC_KEY] = full_lfcs.copy()
+        self.uns["_fit_generation"] = np.int64(self.uns.get("_fit_generation", 0))
+        input_digest = self._lrt_input_digest(
+            cast(pd.DataFrame, self.obsm["_lrt_reduced_design_matrix"])
+        )
+        output_digest = self._lrt_output_digest()
+        if input_digest is None or output_digest is None:
+            raise RuntimeError("Could not construct serialization-safe LRT provenance.")
         full_design = self.obsm.get("design_matrix")
         if not isinstance(full_design, pd.DataFrame):
             raise RuntimeError("LRT requires a DataFrame-backed full design.")
-        lrt_metadata: dict[str, np.int64 | np.ndarray] = {
+        lrt_metadata: dict[str, str | np.int64 | np.ndarray] = {
             "df": np.int64(full_design.shape[1] - reduced_design.shape[1]),
+            "reduced_formula": reduced if isinstance(reduced, str) else "",
+            "fit_generation": np.int64(self.uns.get("_fit_generation", 0)),
+            "full_design_columns": np.asarray(
+                [str(column) for column in full_design.columns]
+            ),
             "full_design_values": full_design.to_numpy(dtype=float, copy=True),
             "obs_names": np.asarray([str(name) for name in self.obs_names]),
             "reduced_design_columns": np.asarray(
                 [str(column) for column in reduced_design.columns]
             ),
             "var_names": np.asarray([str(name) for name in self.var_names]),
+            "input_sha256": input_digest,
+            "output_sha256": output_digest,
         }
         self.uns["_lrt"] = lrt_metadata
 
@@ -2378,6 +2646,20 @@ class DeseqDataSet(ad.AnnData):
             ] = replacement_counts[
                 self.obs["replaceable"].values[:, None] & idx[:, self.var["replaced"]]
             ]
+            replace_counts = self.X
+            if replace_counts is None:
+                raise RuntimeError("Cook replacement requires a count matrix.")
+            if hasattr(replace_counts, "toarray"):
+                replace_counts = replace_counts.toarray()
+            replace_counts = np.asarray(replace_counts).copy()
+            refit_counts = self.counts_to_refit.X
+            if refit_counts is None:
+                raise RuntimeError("Cook replacement requires refitted counts.")
+            if hasattr(refit_counts, "toarray"):
+                refit_counts = refit_counts.toarray()
+            replace_counts[:, self.var["replaced"].to_numpy()] = refit_counts
+            self.layers[_REPLACE_COUNTS_LAYER] = replace_counts
+            self.uns[_REPLACE_COUNTS_OWNER_KEY] = True
 
     def _refit_without_outliers(
         self,

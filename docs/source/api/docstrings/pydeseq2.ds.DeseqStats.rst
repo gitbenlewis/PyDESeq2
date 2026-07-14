@@ -21,6 +21,13 @@
    non-zero ``lfc_null``, any ``alt_hypothesis``, or a supplied
    ``prior_LFC_var``.
 
+   When Cook's outlier refitting replaces counts, the effective count matrix is
+   retained in the internally managed ``dds.layers["replace_counts"]`` layer so
+   both LRT models use the same data. This makes ``"replace_counts"`` a reserved
+   layer name for that fit: an existing user-owned layer with that name causes
+   replacement to raise instead of being overwritten. Because the full replacement
+   matrix is retained, ``low_memory=True`` does not avoid this extra memory cost.
+
 .. autoclass:: DeseqStats
 
    .. rubric:: Methods
