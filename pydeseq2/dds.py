@@ -61,7 +61,9 @@ _LRT_VAR_KEYS = (
 )
 
 _LRT_FULL_LFC_KEY = "_lrt_full_LFC"
-_LRT_REPLACE_COUNTS_LAYER = "_lrt_replace_counts"
+_LRT_CACHE_VERSION = 1
+_REPLACE_COUNTS_LAYER = "replace_counts"
+_REPLACE_COUNTS_OWNER_KEY = "_pydeseq2_replace_counts_owned"
 
 _LRTResult = tuple[
     pd.Series,
@@ -821,6 +823,21 @@ class DeseqDataSet(ad.AnnData):
             del self.layers[_REPLACE_COUNTS_LAYER]
         del self.uns[_REPLACE_COUNTS_OWNER_KEY]
 
+    def _clear_cooks_refit_state(self) -> None:
+        """Remove Cook-refit state before recomputing a complete model fit."""
+        var = cast(pd.DataFrame, self.var)
+        obs = cast(pd.DataFrame, self.obs)
+        for key in ("replaced", "refitted", "_pvalue_cooks_outlier"):
+            if key in var:
+                del var[key]
+        if "replaceable" in obs:
+            del obs["replaceable"]
+        if "replace_cooks" in self.layers:
+            del self.layers["replace_cooks"]
+        for attribute in ("counts_to_refit", "new_all_zeroes_genes"):
+            if hasattr(self, attribute):
+                delattr(self, attribute)
+
     @staticmethod
     def _validated_lrt_counts(values: object) -> np.ndarray:
         """Return canonical int64 counts after strict LRT input validation."""
@@ -841,6 +858,29 @@ class DeseqDataSet(ad.AnnData):
         return np.ascontiguousarray(counts, dtype="<i8")
 
     @staticmethod
+    def _validated_lrt_bool_values(values: object) -> np.ndarray:
+        """Return canonical int8 booleans after strict LRT state validation."""
+        array = np.asarray(values)
+        error = "LRT boolean state must contain only booleans or integers -1, 0, and 1."
+        if array.dtype.kind == "b":
+            return np.ascontiguousarray(array, dtype="<i1")
+        if array.dtype.kind not in {"i", "u"} or not np.isin(array, (-1, 0, 1)).all():
+            raise ValueError(error)
+        return np.ascontiguousarray(array, dtype="<i1")
+
+    @staticmethod
+    def _coerce_lrt_fit_generation(value: object) -> int | None:
+        """Return a serialization-safe LRT fit generation, or ``None``."""
+        if isinstance(value, (bool, np.bool_)) or not isinstance(
+            value, (int, np.integer)
+        ):
+            return None
+        generation = int(value)
+        if generation < 0 or generation > np.iinfo(np.int64).max:
+            return None
+        return generation
+
+    @staticmethod
     def _update_lrt_array_digest(
         digest: _LRTDigest,
         label: str,
@@ -857,7 +897,7 @@ class DeseqDataSet(ad.AnnData):
         elif kind == "int":
             array = DeseqDataSet._validated_lrt_counts(values)
         else:
-            array = np.ascontiguousarray(np.asarray(values, dtype="<i1"))
+            array = DeseqDataSet._validated_lrt_bool_values(values)
 
         encoded_label = label.encode("utf-8")
         shape = np.asarray(array.shape, dtype="<i8").tobytes()
@@ -891,7 +931,9 @@ class DeseqDataSet(ad.AnnData):
             na_value=-1,
         )
 
-    def _lrt_input_digest(self, reduced_design: pd.DataFrame) -> str | None:
+    def _lrt_input_digest(
+        self, reduced_design: pd.DataFrame, reduced_formula: str
+    ) -> str | None:
         """Fingerprint every scientific input used by a prepared LRT."""
         full_design = self.obsm.get("design_matrix")
         full_lfcs = self.varm.get("LFC")
@@ -945,7 +987,7 @@ class DeseqDataSet(ad.AnnData):
         self._update_lrt_array_digest(
             digest,
             "non_zero",
-            self.var["non_zero"].to_numpy(dtype=bool),
+            self.var["non_zero"].to_numpy(),
             "bool",
         )
         self._update_lrt_array_digest(
@@ -969,13 +1011,18 @@ class DeseqDataSet(ad.AnnData):
             "reduced_design_columns",
             [str(column) for column in reduced_design.columns],
         )
+        self._update_lrt_text_digest(
+            digest,
+            "reduced_formula",
+            [reduced_formula],
+        )
 
         if "replaced" in self.var:
             self._update_lrt_array_digest(digest, "has_replaced", [True], "bool")
             self._update_lrt_array_digest(
                 digest,
                 "replaced",
-                self.var["replaced"].to_numpy(dtype=bool),
+                self.var["replaced"].to_numpy(),
                 "bool",
             )
         else:
@@ -1072,17 +1119,42 @@ class DeseqDataSet(ad.AnnData):
             if not pd.Index(reduced_design.index).equals(pd.Index(self.obs_names)):
                 return False
 
-            stored_generation = metadata.get("fit_generation")
-            current_generation = self.uns.get("_fit_generation", 0)
-            if isinstance(stored_generation, np.integer):
-                stored_generation = int(stored_generation)
-            if isinstance(current_generation, np.integer):
-                current_generation = int(current_generation)
-            if not isinstance(stored_generation, int) or not isinstance(
-                current_generation, int
+            stored_cache_version = metadata.get("cache_version")
+            if (
+                isinstance(stored_cache_version, (bool, np.bool_))
+                or not isinstance(stored_cache_version, (int, np.integer))
+                or int(stored_cache_version) != _LRT_CACHE_VERSION
             ):
                 return False
-            if stored_generation != current_generation:
+
+            stored_generation = self._coerce_lrt_fit_generation(
+                metadata.get("fit_generation")
+            )
+            current_generation = self._coerce_lrt_fit_generation(
+                self.uns.get("_fit_generation", 0)
+            )
+            if (
+                stored_generation is None
+                or current_generation is None
+                or stored_generation != current_generation
+            ):
+                return False
+
+            stored_df = metadata.get("df")
+            if (
+                isinstance(stored_df, (bool, np.bool_))
+                or not isinstance(stored_df, (int, np.integer))
+                or int(stored_df) != full_design.shape[1] - reduced_design.shape[1]
+            ):
+                return False
+            reduced_formula = metadata.get("reduced_formula")
+            if not isinstance(reduced_formula, str):
+                return False
+            if list(
+                np.atleast_1d(
+                    np.asarray(metadata.get("reduced_design_columns", []), dtype=str)
+                )
+            ) != [str(column) for column in reduced_design.columns]:
                 return False
             if list(
                 np.atleast_1d(np.asarray(metadata.get("var_names", []), dtype=str))
@@ -1110,7 +1182,7 @@ class DeseqDataSet(ad.AnnData):
             ):
                 return False
 
-            input_digest = self._lrt_input_digest(reduced_design)
+            input_digest = self._lrt_input_digest(reduced_design, reduced_formula)
             output_digest = self._lrt_output_digest()
             return (
                 input_digest is not None
@@ -1131,8 +1203,17 @@ class DeseqDataSet(ad.AnnData):
             or any(key in var for key in _LRT_VAR_KEYS)
             or _LRT_FULL_LFC_KEY in self.varm
         )
+        fit_generation = self._coerce_lrt_fit_generation(
+            self.uns.get("_fit_generation", 0)
+        )
+        if fit_generation is None:
+            fit_generation = 0
         if has_cached_state:
-            self.uns["_fit_generation"] = int(self.uns.get("_fit_generation", 0)) + 1
+            if fit_generation == np.iinfo(np.int64).max:
+                fit_generation = 0
+            else:
+                fit_generation += 1
+        self.uns["_fit_generation"] = np.int64(fit_generation)
 
         if "_deseq2_test" in self.uns:
             del self.uns["_deseq2_test"]
@@ -1308,22 +1389,31 @@ class DeseqDataSet(ad.AnnData):
         )
         lrt_statistics = 2 * (reduced_nll - full_nll)
 
-        full_status = full_converged.iloc[fit_idx]
-        full_failed = full_status.notna().to_numpy() & ~full_status.fillna(
-            True
-        ).to_numpy(dtype=bool)
-        if full_failed.any():
-            warnings.warn(
-                "The full-model fit did not converge for "
-                f"{int(full_failed.sum())} gene(s); inspect "
-                "'_lrt_full_converged' before interpreting those results.",
-                UserWarning,
-                stacklevel=2,
+        def negative_tolerances() -> tuple[np.ndarray, np.ndarray]:
+            full_deviance_scale = np.abs(2 * full_nll)
+            reduced_deviance_scale = np.abs(2 * reduced_nll)
+            likelihood_scale = np.maximum.reduce(
+                (
+                    np.ones_like(full_deviance_scale),
+                    full_deviance_scale,
+                    reduced_deviance_scale,
+                )
             )
+            machine_tolerance = 64 * np.finfo(float).eps * likelihood_scale
+            optimization_tolerance = machine_tolerance + abs(self.beta_tol) * (
+                full_deviance_scale + reduced_deviance_scale + 0.2
+            )
+            return machine_tolerance, optimization_tolerance
 
-        full_deviance_scale = np.abs(2 * full_nll)
-        reduced_deviance_scale = np.abs(2 * reduced_nll)
-        likelihood_scale = np.maximum.reduce(
+        machine_tolerance, _ = negative_tolerances()
+        needs_full_recovery = (
+            ~np.isfinite(full_nll)
+            | np.isneginf(lrt_statistics)
+            | (np.isfinite(lrt_statistics) & (lrt_statistics < -machine_tolerance))
+        )
+        if needs_full_recovery.any() and not refit_full:
+            recovery_positions = np.flatnonzero(needs_full_recovery)
+            recovery_idx = fit_idx[recovery_positions]
             (
                 np.ones_like(full_deviance_scale),
                 full_deviance_scale,
@@ -1360,7 +1450,6 @@ class DeseqDataSet(ad.AnnData):
                 RuntimeWarning,
                 stacklevel=2,
             )
-            materially_negative = materially_negative_mask(lrt_statistics)
 
         full_status = full_converged.iloc[fit_idx]
         full_failed = full_status.notna().to_numpy() & ~full_status.fillna(
@@ -1375,11 +1464,37 @@ class DeseqDataSet(ad.AnnData):
                 stacklevel=2,
             )
 
-        lrt_statistics[(lrt_statistics < 0) & ~materially_negative] = 0.0
+        machine_tolerance, optimization_tolerance = negative_tolerances()
+        both_models_converged = full_status.fillna(False).to_numpy(
+            dtype=bool
+        ) & np.asarray(converged, dtype=bool)
+        allowed_negative = np.where(
+            both_models_converged,
+            optimization_tolerance,
+            machine_tolerance,
+        )
+        nonfinite_likelihood = (
+            ~np.isfinite(full_nll)
+            | ~np.isfinite(reduced_nll)
+            | ~np.isfinite(lrt_statistics)
+        )
+        materially_negative = ~nonfinite_likelihood & (
+            lrt_statistics < -allowed_negative
+        )
+        invalid_lrt = nonfinite_likelihood | materially_negative
+        lrt_statistics[(lrt_statistics < 0) & ~invalid_lrt] = 0.0
+        if nonfinite_likelihood.any():
+            warnings.warn(
+                f"{int(nonfinite_likelihood.sum())} gene(s) had non-finite "
+                "likelihoods after full-model fitting or recovery; their "
+                "statistics, p-values, and full-model deviances were set to NaN.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         if materially_negative.any():
             warnings.warn(
                 f"{int(materially_negative.sum())} gene(s) had materially negative "
-                "LRT statistics after model fitting; their "
+                "LRT statistics after full-model fitting or recovery; their "
                 "statistics and p-values were set to NaN.",
                 RuntimeWarning,
                 stacklevel=2,
@@ -1392,7 +1507,9 @@ class DeseqDataSet(ad.AnnData):
         full_deviance_values = full_deviance.to_numpy(copy=True)
         statistic_values[fit_idx] = lrt_statistics
         p_value_values[fit_idx] = chi2.sf(lrt_statistics, df=degrees_of_freedom)
-        full_deviance_values[fit_idx] = 2 * full_nll
+        fitted_full_deviance = 2 * full_nll
+        fitted_full_deviance[nonfinite_likelihood] = np.nan
+        full_deviance_values[fit_idx] = fitted_full_deviance
         statistics = pd.Series(statistic_values, index=self.var_names, dtype=float)
         p_values = pd.Series(p_value_values, index=self.var_names, dtype=float)
         full_deviance = pd.Series(
@@ -1445,9 +1562,16 @@ class DeseqDataSet(ad.AnnData):
         self.var["_lrt_full_converged"] = full_converged.array
         self.var["_lrt_new_all_zero"] = new_all_zero.to_numpy(dtype=bool)
         self.varm[_LRT_FULL_LFC_KEY] = full_lfcs.copy()
-        self.uns["_fit_generation"] = np.int64(self.uns.get("_fit_generation", 0))
+        fit_generation = self._coerce_lrt_fit_generation(
+            self.uns.get("_fit_generation", 0)
+        )
+        if fit_generation is None:
+            fit_generation = 0
+        self.uns["_fit_generation"] = np.int64(fit_generation)
+        reduced_formula = reduced if isinstance(reduced, str) else ""
         input_digest = self._lrt_input_digest(
-            cast(pd.DataFrame, self.obsm["_lrt_reduced_design_matrix"])
+            cast(pd.DataFrame, self.obsm["_lrt_reduced_design_matrix"]),
+            reduced_formula,
         )
         output_digest = self._lrt_output_digest()
         if input_digest is None or output_digest is None:
@@ -1456,9 +1580,10 @@ class DeseqDataSet(ad.AnnData):
         if not isinstance(full_design, pd.DataFrame):
             raise RuntimeError("LRT requires a DataFrame-backed full design.")
         lrt_metadata: dict[str, str | np.int64 | np.ndarray] = {
+            "cache_version": np.int64(_LRT_CACHE_VERSION),
             "df": np.int64(full_design.shape[1] - reduced_design.shape[1]),
-            "reduced_formula": reduced if isinstance(reduced, str) else "",
-            "fit_generation": np.int64(self.uns.get("_fit_generation", 0)),
+            "reduced_formula": reduced_formula,
+            "fit_generation": np.int64(fit_generation),
             "full_design_columns": np.asarray(
                 [str(column) for column in full_design.columns]
             ),
