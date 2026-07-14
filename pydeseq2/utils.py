@@ -2,6 +2,7 @@ import multiprocessing
 from math import ceil
 from math import floor
 from pathlib import Path
+from typing import Any
 from typing import Literal
 from typing import cast
 
@@ -10,6 +11,7 @@ import pandas as pd
 from matplotlib import pyplot as plt
 from scipy.linalg import solve  # type: ignore
 from scipy.optimize import minimize  # type: ignore
+from scipy.sparse import issparse  # type: ignore
 from scipy.special import gammaln  # type: ignore
 from scipy.special import polygamma  # type: ignore
 from scipy.stats import norm  # type: ignore
@@ -114,7 +116,7 @@ def test_valid_counts(counts: pd.DataFrame | np.ndarray) -> None:
 
     Parameters
     ----------
-    counts : pandas.DataFrame or ndarray
+    counts : pandas.DataFrame, ndarray or scipy sparse matrix
         Raw counts. One column per gene, rows are indexed by sample barcodes.
     """
     if isinstance(counts, pd.DataFrame):
@@ -122,6 +124,17 @@ def test_valid_counts(counts: pd.DataFrame | np.ndarray) -> None:
             raise ValueError("NaNs are not allowed in the count matrix.")
         if not np.issubdtype(counts.to_numpy().dtype, np.number):
             raise ValueError("The count matrix should only contain numbers.")
+    elif issparse(counts):
+        values = np.asarray(cast(Any, counts).data)
+        if not np.issubdtype(values.dtype, np.number):
+            raise ValueError("The count matrix should only contain numbers.")
+        if np.isnan(values).any():
+            raise ValueError("NaNs are not allowed in the count matrix.")
+        if (values % 1 != 0).any():
+            raise ValueError("The count matrix should only contain integers.")
+        if (values < 0).any():
+            raise ValueError("The count matrix should only contain non-negative values.")
+        return
     else:
         if np.isnan(counts).any().any():
             raise ValueError("NaNs are not allowed in the count matrix.")
@@ -876,8 +889,13 @@ def fit_moments_dispersions(
     """
     # Exclude genes with all zeroes
     normed_counts = normed_counts[:, ~(normed_counts == 0).all(axis=0)]
-    # mean inverse size factor
-    s_mean_inv = (1 / size_factors).mean(axis=0)
+    # Mean inverse size factor. For gene-specific normalization factors, DESeq2
+    # first averages factors across genes within each sample, then averages the
+    # inverse sample means into one scalar shared by all genes.
+    if size_factors.ndim == 1:
+        s_mean_inv = (1 / size_factors).mean()
+    else:
+        s_mean_inv = (1 / size_factors.mean(axis=1)).mean()
     mu = normed_counts.mean(0)
     sigma = normed_counts.var(0, ddof=1)
     # ddof=1 is to use an unbiased estimator, as in R

@@ -11,6 +11,13 @@ from pydeseq2 import inference
 from pydeseq2 import utils
 
 
+def _gene_factors(factors: np.ndarray, gene_idx: int) -> np.ndarray:
+    """Select one gene's factors from a sample vector or sample-by-gene matrix."""
+    if factors.ndim == 2:
+        return factors[:, gene_idx]
+    return factors
+
+
 class DefaultInference(inference.Inference):
     """Default DESeq2-related inference methods, using scipy/sklearn/numpy.
 
@@ -71,7 +78,7 @@ class DefaultInference(inference.Inference):
                 )(
                     delayed(utils.fit_lin_mu)(
                         counts=counts[:, i],
-                        size_factors=size_factors,
+                        size_factors=_gene_factors(size_factors, i),
                         design_matrix=design_matrix,
                         min_mu=min_mu,
                     )
@@ -101,7 +108,7 @@ class DefaultInference(inference.Inference):
             )(
                 delayed(utils.irls_solver)(
                     counts=counts[:, i],
-                    size_factors=size_factors,
+                    size_factors=_gene_factors(size_factors, i),
                     design_matrix=design_matrix,
                     disp=disp[i],
                     min_mu=min_mu,
@@ -251,7 +258,7 @@ class DefaultInference(inference.Inference):
                     design_matrix=design_matrix,
                     counts=counts[:, i],
                     size=size[i],
-                    offset=offset,
+                    offset=_gene_factors(offset, i),
                     prior_no_shrink_scale=prior_no_shrink_scale,
                     prior_scale=prior_scale,
                     optimizer=optimizer,

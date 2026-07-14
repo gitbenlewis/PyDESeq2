@@ -27,7 +27,8 @@ class Inference(ABC):
             Raw counts.
 
         size_factors : ndarray
-            Sample-wise scaling factors (obtained from median-of-ratios).
+            Sample-wise scaling factors, or sample-by-gene normalization factors
+            (obtained from median-of-ratios and optional gene-specific offsets).
 
         design_matrix : ndarray
             Design matrix.
@@ -66,7 +67,8 @@ class Inference(ABC):
             Raw counts.
 
         size_factors : ndarray
-            Sample-wise scaling factors (obtained from median-of-ratios).
+            Sample-wise scaling factors, or sample-by-gene normalization factors
+            (obtained from median-of-ratios and optional gene-specific offsets).
 
         design_matrix : ndarray
             Design matrix.

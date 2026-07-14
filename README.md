@@ -93,6 +93,31 @@ Please don't hesitate to open an issue in case you encounter any issue due to po
 The [Getting Started](https://pydeseq2.readthedocs.io/en/latest/auto_examples/index.html) section of the documentation
 contains downloadable examples on how to use PyDESeq2.
 
+### Transcript-length normalization
+
+For unscaled estimated gene counts imported from transcript-level quantifiers
+(`countsFromAbundance="no"` in tximport), pass the matching average transcript lengths
+alongside the counts. Both matrices must use samples as rows and genes as columns. When
+using data frames, their labels and ordering must be identical; arrays must already use
+the same ordering:
+
+```python
+dds = DeseqDataSet(
+    counts=estimated_counts,
+    metadata=metadata,
+    transcript_lengths=average_transcript_lengths,
+    design="~condition",
+)
+dds.deseq2()
+```
+
+Following DESeq2's `DESeqDataSetFromTximport()` workflow, PyDESeq2 rounds estimated
+counts and combines transcript-length offsets with median-of-ratios library-size
+normalization. Average lengths and the resulting sample-by-gene factors are available
+in `dds.layers["avg_tx_length"]` and `dds.layers["normalization_factors"]`.
+The `ratio` and `poscounts` size-factor methods are supported; `iterative` is not
+currently compatible with transcript-length offsets.
+
 
 ### Documentation
 
