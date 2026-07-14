@@ -72,6 +72,22 @@ class DeseqStats:
     quiet : bool
         Suppress deseq2 status updates during fit.
 
+    n_cpus : int, optional
+        Number of CPUs to use. If an ``inference`` object is provided and exposes an
+        ``n_cpus`` attribute, this value overrides it. Otherwise, it configures the
+        default inference implementation. (default: ``None``).
+
+    test : {"Wald", "LRT"}, optional
+        Statistical test to run. ``None`` inherits the test prepared on ``dds`` (or
+        defaults to ``"Wald"`` when no test was prepared). Test names are
+        case-sensitive. (default: ``None``).
+
+    reduced : str or pandas.DataFrame, optional
+        Nested reduced design for ``test="LRT"``. A formula is supported when the full
+        design is formula-based, and an explicit matrix is supported when the full
+        design is matrix-based. If omitted for an inherited, prepared LRT, the cached
+        reduced design is reused. (default: ``None``).
+
     Attributes
     ----------
     base_mean : pandas.Series
@@ -82,6 +98,18 @@ class DeseqStats:
 
     alt_hypothesis : str, optional
         The alternative hypothesis for computing wald p-values.
+
+    test : {"Wald", "LRT"}
+        Statistical test selected for this result object.
+
+    reduced : str or pandas.DataFrame, optional
+        User-provided reduced LRT design, when applicable.
+
+    reduced_design_matrix : pandas.DataFrame, optional
+        Validated reduced LRT design matrix, when applicable.
+
+    lrt_df : int
+        Degrees of freedom for an LRT, equal to the full-minus-reduced model rank.
 
     contrast_vector : ndarray
         Vector encoding the contrast (variable being tested).
@@ -102,10 +130,22 @@ class DeseqStats:
         Standard LFC error.
 
     statistics : pandas.Series
-        Wald statistics.
+        Wald statistics or omnibus full-versus-reduced LRT statistics.
 
     p_values : pandas.Series
-        P-values estimated from Wald statistics.
+        P-values estimated from the selected Wald or LRT statistics.
+
+    reduced_converged : pandas.Series
+        Per-gene reduced-model convergence flags for an LRT.
+
+    full_converged : pandas.Series
+        Per-gene full-model convergence flags for an LRT.
+
+    full_deviance : pandas.Series
+        Per-gene full-model deviance used by an LRT.
+
+    new_all_zero : pandas.Series
+        Per-gene flags identifying genes made all-zero by Cook's outlier replacement.
 
     padj : pandas.Series
         P-values adjusted for multiple testing.
@@ -143,6 +183,9 @@ class DeseqStats:
         inference: Inference | None = None,
         quiet: bool = False,
         n_cpus: int | None = None,
+        *,
+        test: Literal["Wald", "LRT"] | None = None,
+        reduced: str | pd.DataFrame | None = None,
     ) -> None:
         assert "LFC" in dds.varm, (
             "Please provide a fitted DeseqDataSet by first running the `deseq2` method."
@@ -150,11 +193,39 @@ class DeseqStats:
 
         self.dds = dds
 
+        stored_test = self.dds.uns.get("_deseq2_test", "Wald")
+        self.test = str(stored_test) if test is None else test
+        self.dds._validate_test(self.test)
+
         self.alpha = alpha
         self.cooks_filter = cooks_filter
         self.independent_filter = independent_filter
         self.base_mean = self.dds.var["_normed_means"].copy()
         self.prior_LFC_var = prior_LFC_var
+
+        if self.test == "Wald":
+            if reduced is not None:
+                raise ValueError("'reduced' is only supported when test='LRT'.")
+            self.reduced = None
+            self.reduced_design_matrix = None
+        else:
+            if prior_LFC_var is not None or lfc_null != 0 or alt_hypothesis is not None:
+                raise ValueError(
+                    "prior_LFC_var, lfc_null, and alt_hypothesis are only supported "
+                    "for Wald tests."
+                )
+            if "_lrt" in self.dds.uns and not self.dds._lrt_fit_state_matches():
+                raise RuntimeError(
+                    "Cached LRT fit state no longer matches this DeseqDataSet. "
+                    "Rerun dds.deseq2(test='LRT', reduced=...) before creating "
+                    "DeseqStats."
+                )
+            self.reduced = reduced
+            self.reduced_design_matrix = self.dds._prepare_lrt_reduced_design(reduced)
+            self.lrt_df = int(
+                self.dds.obsm["design_matrix"].shape[1]
+                - self.reduced_design_matrix.shape[1]
+            )
 
         if lfc_null < 0 and alt_hypothesis in {"greaterAbs", "lessAbs"}:
             raise ValueError(
@@ -191,20 +262,24 @@ class DeseqStats:
         self.shrunk_LFCs = False
         self.quiet = quiet
 
-        if inference:
-            if n_cpus:
-                if hasattr(inference, "n_cpus"):
-                    inference.n_cpus = n_cpus
-                else:
-                    warnings.warn(
-                        "The provided inference object does not have an n_cpus "
-                        "attribute, cannot override `n_cpus`.",
-                        UserWarning,
-                        stacklevel=2,
-                    )
-
         # Initialize the inference object.
-        self.inference = inference or DefaultInference(n_cpus=n_cpus)
+        if inference is not None:
+            self.inference = inference
+        elif self.test == "LRT":
+            self.inference = self.dds.inference
+        else:
+            self.inference = DefaultInference(n_cpus=n_cpus)
+
+        if n_cpus is not None and (inference is not None or self.test == "LRT"):
+            if hasattr(self.inference, "n_cpus"):
+                self.inference.n_cpus = n_cpus
+            else:
+                warnings.warn(
+                    "The selected inference object does not have an n_cpus "
+                    "attribute, cannot override `n_cpus`.",
+                    UserWarning,
+                    stacklevel=2,
+                )
 
         # If the `refit_cooks` attribute of the dds object is True, check that outliers
         # were actually refitted.
@@ -252,16 +327,20 @@ class DeseqStats:
                 f"positive lfc_null value (got {lfc_null}).",
             )
 
+        if self.test == "LRT" and (lfc_null != 0 or alt_hypothesis is not None):
+            raise ValueError(
+                "lfc_null and alt_hypothesis are only supported for Wald tests."
+            )
+
         if (
             not hasattr(self, "p_values")
             or self.lfc_null != lfc_null
             or self.alt_hypothesis != alt_hypothesis
         ):
-            # Estimate p-values with Wald test
             self.lfc_null = lfc_null
             self.alt_hypothesis = alt_hypothesis
             rerun_summary = True
-            self.run_wald_test()
+            self._run_selected_test()
 
         if self.cooks_filter:
             # Filter p-values based on Cooks outliers
@@ -289,23 +368,63 @@ class DeseqStats:
             if isinstance(self.contrast, np.ndarray):
                 # The contrast vector was directly provided
                 print(
-                    f"Log2 fold change & Wald test p-value, contrast vector: "
+                    f"Log2 fold change & {self.test} test p-value, contrast vector: "
                     f"{self.contrast}"
                 )
             else:
                 # The factor is categorical
                 print(
-                    f"Log2 fold change & Wald test p-value: "
+                    f"Log2 fold change & {self.test} test p-value: "
                     f"{self.contrast[0]} {self.contrast[1]} vs {self.contrast[2]}"
                 )
             print(self.results_df)
+
+    def _run_wald_inference(
+        self, *, announce: bool = True
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Compute Wald quantities without changing the selected test result."""
+        num_vars = self.design_matrix.shape[1]
+        normalization_factors = self.dds._get_normalization_factors()
+        if normalization_factors.ndim == 1:
+            normalization_factors = normalization_factors[:, None]
+        mu = np.exp(self.design_matrix @ self.LFC.T).to_numpy() * normalization_factors
+
+        if self.prior_LFC_var is not None:
+            ridge_factor = np.diag(1 / self.prior_LFC_var**2)
+        else:
+            ridge_factor = np.diag(np.repeat(1e-6, num_vars))
+
+        if announce and not self.quiet:
+            print("Running Wald tests...", file=sys.stderr)
+        start = time.time()
+        pvals, stats, se = self.inference.wald_test(
+            design_matrix=self.design_matrix.values,
+            disp=self.dds.var["dispersions"].values,
+            lfc=self.LFC.values,
+            mu=mu,
+            ridge_factor=ridge_factor,
+            contrast=self.contrast_vector,
+            lfc_null=np.log(2) * self.lfc_null,
+            alt_hypothesis=self.alt_hypothesis,
+        )
+        if announce and not self.quiet:
+            print(f"... done in {time.time() - start:.2f} seconds.\n", file=sys.stderr)
+        return pvals, stats, se
+
+    def _run_selected_test(self) -> None:
+        """Run the statistical test selected at construction."""
+        if self.test == "Wald":
+            self.run_wald_test()
+        else:
+            self.run_lrt_test()
 
     def run_wald_test(self) -> None:
         """Perform a Wald test.
 
         Get gene-wise p-values for gene over/under-expression.
         """
-        num_vars = self.design_matrix.shape[1]
+        if self.test != "Wald":
+            raise ValueError("run_wald_test() requires test='Wald'.")
 
         # Raise a warning if LFCs are shrunk.
         if self.shrunk_LFCs:
@@ -317,36 +436,7 @@ class DeseqStats:
                     file=sys.stderr,
                 )
 
-        normalization_factors = self.dds._get_normalization_factors()
-        if normalization_factors.ndim == 1:
-            normalization_factors = normalization_factors[:, None]
-        mu = np.exp(self.design_matrix @ self.LFC.T).to_numpy() * normalization_factors
-
-        # Set regularization factors.
-        if self.prior_LFC_var is not None:
-            ridge_factor = np.diag(1 / self.prior_LFC_var**2)
-        else:
-            ridge_factor = np.diag(np.repeat(1e-6, num_vars))
-
-        design_matrix = self.design_matrix.values
-        LFCs = self.LFC.values
-
-        if not self.quiet:
-            print("Running Wald tests...", file=sys.stderr)
-        start = time.time()
-        pvals, stats, se = self.inference.wald_test(
-            design_matrix=design_matrix,
-            disp=self.dds.var["dispersions"].values,
-            lfc=LFCs,
-            mu=mu,
-            ridge_factor=ridge_factor,
-            contrast=self.contrast_vector,
-            lfc_null=np.log(2) * self.lfc_null,  # Convert log2 to natural log
-            alt_hypothesis=self.alt_hypothesis,
-        )
-        end = time.time()
-        if not self.quiet:
-            print(f"... done in {end - start:.2f} seconds.\n", file=sys.stderr)
+        pvals, stats, se = self._run_wald_inference()
 
         self.p_values: pd.Series = pd.Series(pvals, index=self.dds.var_names)
         self.statistics: pd.Series = pd.Series(stats, index=self.dds.var_names)
@@ -357,6 +447,54 @@ class DeseqStats:
             self.SE.loc[self.dds.new_all_zeroes_genes] = 0.0
             self.statistics.loc[self.dds.new_all_zeroes_genes] = 0.0
             self.p_values.loc[self.dds.new_all_zeroes_genes] = 1.0
+
+    def run_lrt_test(self) -> None:
+        """Perform the selected full-versus-reduced likelihood-ratio test."""
+        if self.test != "LRT" or self.reduced_design_matrix is None:
+            raise ValueError("run_lrt_test() requires test='LRT' and a reduced model.")
+        if getattr(self, "_lrt_has_run", False):
+            return
+
+        use_dds_cache = (
+            self.inference is self.dds.inference
+            and self.dds._lrt_cache_matches(self.reduced_design_matrix)
+        )
+        if use_dds_cache:
+            results = self.dds._load_lrt_results()
+        else:
+            if not self.quiet:
+                print("Running likelihood ratio tests...", file=sys.stderr)
+            start = time.time()
+            results = self.dds._compute_lrt(
+                self.reduced_design_matrix,
+                inference=self.inference,
+            )
+            if not self.quiet:
+                print(
+                    f"... done in {time.time() - start:.2f} seconds.\n",
+                    file=sys.stderr,
+                )
+
+        (
+            statistics,
+            p_values,
+            full_deviance,
+            reduced_converged,
+            full_converged,
+            new_all_zero,
+            full_lfcs,
+        ) = results
+        self.statistics = statistics.copy()
+        self.p_values = p_values.copy()
+        self.full_deviance = full_deviance.copy()
+        self.reduced_converged = reduced_converged.copy()
+        self.full_converged = full_converged.copy()
+        self.new_all_zero = new_all_zero.copy()
+        self.LFC = full_lfcs.copy()
+        _, _, se = self._run_wald_inference(announce=False)
+        self.SE = pd.Series(se, index=self.dds.var_names)
+        self.SE.loc[self.new_all_zero.fillna(False).astype(bool)] = 0.0
+        self._lrt_has_run = True
 
     # TODO update this to reflect the new contrast format
     def lfc_shrink(self, coeff: str, adapt: bool = True) -> None:
@@ -384,13 +522,18 @@ class DeseqStats:
 
         design_matrix = self.design_matrix.values
         size = 1.0 / self.dds.var["dispersions"].values
-        offset = np.log(self.dds._get_normalization_factors(self.dds.non_zero_idx))
+        effective_counts = self.dds._effective_counts()
+        effective_nonzero = (effective_counts != 0).any(axis=0)
+        shrink_mask = self.dds.var["non_zero"].to_numpy(dtype=bool) & effective_nonzero
+        shrink_idx = np.flatnonzero(shrink_mask)
+        shrink_genes = self.dds.var_names[shrink_idx]
+        offset = np.log(self.dds._get_normalization_factors(shrink_idx))
 
         # Set priors
         prior_no_shrink_scale = 15
         prior_scale = 1
         if adapt:
-            prior_var = self._fit_prior_var(coeff_idx=coeff_idx)
+            prior_var = self._fit_prior_var(coeff_idx=coeff_idx, gene_mask=shrink_mask)
             prior_scale = np.minimum(np.sqrt(prior_var), 1)
 
         if not self.quiet:
@@ -398,8 +541,8 @@ class DeseqStats:
         start = time.time()
         lfcs, inv_hessians, l_bfgs_b_converged_ = self.inference.lfc_shrink_nbinom_glm(
             design_matrix=design_matrix,
-            counts=self.dds.X[:, self.dds.non_zero_idx],
-            size=size[self.dds.non_zero_idx],
+            counts=effective_counts[:, shrink_idx],
+            size=size[shrink_idx],
             offset=offset,
             prior_no_shrink_scale=prior_no_shrink_scale,
             prior_scale=prior_scale,
@@ -428,7 +571,7 @@ class DeseqStats:
             )
 
         # Only update genes with valid (non-NaN) shrinkage results
-        valid_genes = self.dds.non_zero_genes[~nan_mask]
+        valid_genes = shrink_genes[~nan_mask]
         self.LFC.loc[valid_genes, coeff] = new_lfc_values[~nan_mask]
         self.SE.loc[valid_genes] = new_se_values[~nan_mask]
 
@@ -436,7 +579,7 @@ class DeseqStats:
             pd.array([pd.NA] * len(self.dds.var_names), dtype="boolean"),
             index=self.dds.var_names,
         )
-        self._LFC_shrink_converged.loc[self.dds.non_zero_genes] = l_bfgs_b_converged_
+        self._LFC_shrink_converged.loc[shrink_genes] = l_bfgs_b_converged_
 
         # Set a flag to indicate that LFCs were shrunk
         self.shrunk_LFCs = True
@@ -446,7 +589,7 @@ class DeseqStats:
             self.results_df["log2FoldChange"] = self.LFC.iloc[:, coeff_idx] / np.log(2)
             self.results_df["lfcSE"] = self.SE / np.log(2)
             if not self.quiet:
-                print(f"Shrunk log2 fold change & Wald test p-value: {coeff}")
+                print(f"Shrunk log2 fold change & {self.test} test p-value: {coeff}")
                 print(self.results_df)
 
     def plot_MA(self, log: bool = True, save_path: str | None = None, **kwargs):
@@ -493,7 +636,7 @@ class DeseqStats:
         """
         # Check that p-values are available. If not, compute them.
         if not hasattr(self, "p_values"):
-            self.run_wald_test()
+            self._run_selected_test()
 
         lower_quantile = np.mean(self.base_mean == 0)
 
@@ -536,8 +679,7 @@ class DeseqStats:
         This method and the `_independent_filtering` are mutually exclusive.
         """
         if not hasattr(self, "p_values"):
-            # Estimate p-values with Wald test
-            self.run_wald_test()
+            self._run_selected_test()
 
         self.padj = pd.Series(np.nan, index=self.dds.var_names)
         self.padj.loc[~self.p_values.isna()] = false_discovery_control(
@@ -548,12 +690,21 @@ class DeseqStats:
         """Filter p-values based on Cooks outliers."""
         # Check that p-values are available. If not, compute them.
         if not hasattr(self, "p_values"):
-            self.run_wald_test()
+            self._run_selected_test()
 
-        self.p_values[self.dds.cooks_outlier()] = np.nan
+        cooks_outlier = self.dds.cooks_outlier().copy()
+        if self.test == "LRT":
+            new_all_zero = self.new_all_zero.fillna(False).astype(bool)
+            cooks_outlier.loc[new_all_zero] = False
+        self.p_values[cooks_outlier] = np.nan
 
     def _fit_prior_var(
-        self, coeff_idx: str, min_var: float = 1e-6, max_var: float = 400.0
+        self,
+        coeff_idx: int,
+        min_var: float = 1e-6,
+        max_var: float = 400.0,
+        *,
+        gene_mask: np.ndarray | pd.Series | None = None,
     ) -> float:
         """Estimate the prior variance of the apeGLM model.
 
@@ -561,7 +712,7 @@ class DeseqStats:
 
         Parameters
         ----------
-        coeff_idx : str
+        coeff_idx : int
             Index of the coefficient to shrink.
 
         min_var : float
@@ -576,6 +727,9 @@ class DeseqStats:
             Estimated prior variance.
         """
         keep = ~self.LFC.iloc[:, coeff_idx].isna()
+        if gene_mask is not None:
+            keep &= np.asarray(gene_mask, dtype=bool)
+
         S = self.LFC[keep].iloc[:, coeff_idx] ** 2
         D = self.SE[keep] ** 2
 
