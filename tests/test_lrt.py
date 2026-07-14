@@ -1135,6 +1135,7 @@ def test_lrt_cache_digest_rejects_mutated_scientific_inputs(counts_df, metadata)
     original_dispersions = dds.var["dispersions"].copy()
     original_lfcs = dds.varm["LFC"].copy()
     original_lfc_converged = dds.var["_LFC_converged"].copy()
+    original_non_zero = dds.var["non_zero"].copy()
     original_reduced = dds.obsm["_lrt_reduced_design_matrix"].copy()
     original_min_mu = dds.min_mu
     original_beta_tol = dds.beta_tol
@@ -1192,6 +1193,14 @@ def test_lrt_cache_digest_rejects_mutated_scientific_inputs(counts_df, metadata)
     dds.var["_LFC_converged"] = original_lfc_converged
     assert dds._lrt_fit_state_matches()
 
+    malformed_non_zero = original_non_zero.astype(np.int64)
+    true_index = original_non_zero[original_non_zero].index[0]
+    malformed_non_zero.loc[true_index] = 256
+    dds.var["non_zero"] = malformed_non_zero
+    assert_stale()
+    dds.var["non_zero"] = original_non_zero
+    assert dds._lrt_fit_state_matches()
+
     changed_reduced = original_reduced.copy()
     changed_reduced.iloc[0, 0] += 1
     dds.obsm["_lrt_reduced_design_matrix"] = changed_reduced
@@ -1220,6 +1229,7 @@ def test_lrt_cache_digest_rejects_mutated_outputs_and_corruption(counts_df, meta
         reduced="~1",
     )
     original_pvalues = dds.var["_lrt_pvalue"].copy()
+    original_new_all_zero = dds.var["_lrt_new_all_zero"].copy()
     original_full_lfcs = dds.varm["_lrt_full_LFC"].copy()
     original_metadata = dict(dds.uns["_lrt"])
 
@@ -1235,10 +1245,49 @@ def test_lrt_cache_digest_rejects_mutated_outputs_and_corruption(counts_df, meta
     dds.varm["_lrt_full_LFC"] = original_full_lfcs
     assert dds._lrt_fit_state_matches()
 
+    malformed_new_all_zero = original_new_all_zero.astype(np.int64)
+    false_index = original_new_all_zero[~original_new_all_zero].index[0]
+    malformed_new_all_zero.loc[false_index] = 256
+    dds.var["_lrt_new_all_zero"] = malformed_new_all_zero
+    assert not dds._lrt_fit_state_matches()
+    dds.var["_lrt_new_all_zero"] = original_new_all_zero
+    assert dds._lrt_fit_state_matches()
+
     dds.uns["_lrt"] = {"fit_generation": "corrupt"}
     assert not dds._lrt_fit_state_matches()
     dds.uns["_lrt"] = original_metadata
     assert dds._lrt_fit_state_matches()
+
+    for key, corrupt_value in (
+        ("cache_version", 1.0),
+        ("cache_version", True),
+        ("df", float(original_metadata["df"])),
+        ("df", int(original_metadata["df"]) + 1),
+        ("reduced_design_columns", np.asarray(["corrupt"])),
+        ("reduced_formula", "~condition"),
+        ("reduced_formula", []),
+    ):
+        corrupt_metadata = dict(original_metadata)
+        corrupt_metadata[key] = corrupt_value
+        dds.uns["_lrt"] = corrupt_metadata
+        assert not dds._lrt_fit_state_matches()
+        dds.uns["_lrt"] = original_metadata
+        assert dds._lrt_fit_state_matches()
+
+    metadata_without_version = dict(original_metadata)
+    del metadata_without_version["cache_version"]
+    dds.uns["_lrt"] = metadata_without_version
+    assert not dds._lrt_fit_state_matches()
+    dds.uns["_lrt"] = original_metadata
+    assert dds._lrt_fit_state_matches()
+
+    dds.uns["_fit_generation"] = "corrupt"
+    assert not dds._lrt_fit_state_matches()
+    dds.deseq2(test="LRT", reduced="~1")
+    assert dds._lrt_fit_state_matches()
+    fit_generation = dds.uns["_fit_generation"]
+    assert isinstance(fit_generation, (int, np.integer))
+    assert not isinstance(fit_generation, (bool, np.bool_))
 
 
 def test_lrt_rejects_missing_or_mutated_cook_replacement_state(counts_df, metadata):
@@ -1272,6 +1321,38 @@ def test_lrt_rejects_missing_or_mutated_cook_replacement_state(counts_df, metada
     del dds.uns["_pydeseq2_replace_counts_owned"]
     with pytest.raises(RuntimeError, match="effective counts used during Cook"):
         _condition_stats(dds, test="LRT", reduced="~1")
+
+
+def test_full_rerun_clears_stale_cook_replacement_state(counts_df, metadata):
+    """Changing Cook-refit policy between full runs must rebuild clean state."""
+    counts = counts_df.copy()
+    counts.loc["sample1", "gene1"] = 200
+    dds = _fit_dds(
+        counts,
+        metadata,
+        "~condition",
+        refit_cooks=True,
+        test="LRT",
+        reduced="~1",
+    )
+    assert dds.var["replaced"].any()
+    assert "replace_counts" in dds.layers
+
+    dds.refit_cooks = False
+    dds.deseq2(test="LRT", reduced="~1")
+    assert "replaced" not in dds.var
+    assert "refitted" not in dds.var
+    assert "replace_counts" not in dds.layers
+    assert "_pydeseq2_replace_counts_owned" not in dds.uns
+    assert dds._lrt_fit_state_matches()
+    stats = _condition_stats(dds, test=None, reduced=None)
+    assert stats.statistics.loc[dds.var["non_zero"]].notna().all()
+
+    dds.refit_cooks = True
+    dds.deseq2(test="LRT", reduced="~1")
+    assert dds.var["replaced"].any()
+    assert "replace_counts" in dds.layers
+    assert dds._lrt_fit_state_matches()
 
 
 def test_full_model_nonconvergence_warns_but_keeps_lrt_results(counts_df, metadata):
@@ -1308,3 +1389,156 @@ def test_materially_negative_statistic_triggers_targeted_full_refit(counts_df, m
     assert np.isfinite(statistics.loc["gene1"])
     assert statistics.loc["gene1"] >= 0
     assert not np.allclose(recovered_lfcs.loc["gene1"], bad_lfcs.loc["gene1"])
+
+
+def test_nonfinite_cached_full_likelihood_triggers_recovery(counts_df, metadata):
+    """A finite cached LFC that underflows its mean should be refitted."""
+    dds = _fit_dds(counts_df + 1, metadata, "~condition")
+    bad_lfcs = dds.varm["LFC"].copy()
+    bad_lfcs.loc["gene1", :] = [-1000.0, 0.0]
+    dds.varm["LFC"] = bad_lfcs
+    inference = CountingInference()
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        results = dds._compute_lrt(
+            dds._prepare_lrt_reduced_design("~1"),
+            inference=inference,
+        )
+    statistics, p_values, full_deviance, _, _, _, recovered_lfcs = results
+
+    assert [design.shape[1] for _, design in inference.irls_inputs] == [1, 2]
+    assert np.isfinite(statistics.loc["gene1"])
+    assert statistics.loc["gene1"] >= 0
+    assert np.isfinite(p_values.loc["gene1"])
+    assert np.isfinite(full_deviance.loc["gene1"])
+    assert np.isfinite(recovered_lfcs.loc["gene1"]).all()
+    assert not np.allclose(recovered_lfcs.loc["gene1"], bad_lfcs.loc["gene1"])
+
+
+def test_optimizer_scale_negative_roundoff_is_clipped(counts_df, metadata, monkeypatch):
+    """A converged post-recovery negative within beta tolerance maps to zero."""
+    dds = _fit_dds(counts_df, metadata, "~condition")
+    inference = CountingInference()
+    small_negative = 1e-8
+    calls: list[int] = []
+
+    def controlled_nll(counts, mu, alpha):
+        n_genes = np.asarray(counts).shape[1]
+        call = len(calls)
+        calls.append(n_genes)
+        if call == 0:
+            return np.full(n_genes, 100.0)
+        if call == 1:
+            reduced_nll = np.full(n_genes, 101.0)
+            reduced_nll[0] = 100.0 - small_negative / 2
+            return reduced_nll
+        if call == 2:
+            assert n_genes == 1
+            return np.full(n_genes, 100.0)
+        raise AssertionError("Unexpected extra nb_nll call.")
+
+    monkeypatch.setattr("pydeseq2.dds.nb_nll", controlled_nll)
+    results = dds._compute_lrt(
+        dds._prepare_lrt_reduced_design("~1"),
+        inference=inference,
+    )
+    statistics, p_values = results[:2]
+    fitted_genes = dds.var_names[
+        dds.var["non_zero"]
+        & dds.var["dispersions"].notna()
+        & np.isfinite(dds.varm["LFC"]).all(axis=1)
+    ]
+    recovered_gene = fitted_genes[0]
+
+    assert small_negative > 64 * np.finfo(float).eps * 200
+    assert calls == [len(fitted_genes), len(fitted_genes), 1]
+    assert [design.shape[1] for _, design in inference.irls_inputs] == [1, 2]
+    assert statistics.loc[recovered_gene] == 0.0
+    assert p_values.loc[recovered_gene] == 1.0
+
+
+def test_nonfinite_likelihood_after_recovery_is_invalid(
+    counts_df, metadata, monkeypatch
+):
+    """Persistent non-finite likelihoods must never become a valid null result."""
+    dds = _fit_dds(counts_df, metadata, "~condition")
+    inference = CountingInference()
+    calls: list[int] = []
+
+    def controlled_nll(counts, mu, alpha):
+        n_genes = np.asarray(counts).shape[1]
+        call = len(calls)
+        calls.append(n_genes)
+        if call == 0:
+            full_nll = np.full(n_genes, 100.0)
+            full_nll[0] = np.inf
+            return full_nll
+        if call == 1:
+            return np.full(n_genes, 101.0)
+        if call == 2:
+            assert n_genes == 1
+            return np.full(n_genes, np.inf)
+        raise AssertionError("Unexpected extra nb_nll call.")
+
+    monkeypatch.setattr("pydeseq2.dds.nb_nll", controlled_nll)
+    with pytest.warns(RuntimeWarning, match="non-finite likelihoods"):
+        results = dds._compute_lrt(
+            dds._prepare_lrt_reduced_design("~1"),
+            inference=inference,
+        )
+    statistics, p_values, full_deviance = results[:3]
+    fitted_genes = dds.var_names[
+        dds.var["non_zero"]
+        & dds.var["dispersions"].notna()
+        & np.isfinite(dds.varm["LFC"]).all(axis=1)
+    ]
+    invalid_gene = fitted_genes[0]
+
+    assert calls == [len(fitted_genes), len(fitted_genes), 1]
+    assert [design.shape[1] for _, design in inference.irls_inputs] == [1, 2]
+    assert pd.isna(statistics.loc[invalid_gene])
+    assert pd.isna(p_values.loc[invalid_gene])
+    assert pd.isna(full_deviance.loc[invalid_gene])
+
+
+def test_exact_null_roundoff_does_not_drop_lrt_results():
+    """Optimizer-scale negative roundoff under an exact null should map to zero."""
+    rng = np.random.default_rng(91)
+    n_per_group = 12
+    n_genes = 500
+    means = np.exp(rng.normal(3.5, 1.0, n_genes))
+    dispersion = 0.2
+    size = 1 / dispersion
+    block = rng.negative_binomial(
+        size,
+        size / (size + means),
+        size=(n_per_group, n_genes),
+    )
+    sample_names = [f"sample{i}" for i in range(2 * n_per_group)]
+    gene_names = [f"g{i}" for i in range(n_genes)]
+    counts = pd.DataFrame(
+        np.vstack((block, block)),
+        index=sample_names,
+        columns=gene_names,
+    )
+    metadata = pd.DataFrame(
+        {"condition": ["A"] * n_per_group + ["B"] * n_per_group},
+        index=sample_names,
+    )
+    dds = DeseqDataSet(
+        counts=counts,
+        metadata=metadata,
+        design="~condition",
+        fit_type="mean",
+        refit_cooks=False,
+        inference=DefaultInference(n_cpus=1),
+        quiet=True,
+    )
+    dds.deseq2(test="LRT", reduced="~1")
+    stats = _condition_stats(dds, test=None, reduced=None)
+
+    fitted = dds.var["non_zero"] & dds.var["dispersions"].notna()
+    assert stats.statistics.loc[fitted].notna().all()
+    assert stats.p_values.loc[fitted].notna().all()
+    np.testing.assert_allclose(stats.statistics.loc[fitted], 0.0, atol=1e-8)
+    assert (stats.p_values.loc[fitted] > 0.999).all()
