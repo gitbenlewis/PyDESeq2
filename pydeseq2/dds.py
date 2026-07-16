@@ -38,7 +38,9 @@ def _rounded_counts(counts: Any) -> Any:
     if isinstance(counts, np.ndarray):
         return np.rint(counts)
     rounded = counts.copy()
+    rounded.sum_duplicates()
     rounded.data = np.rint(rounded.data)
+    rounded.eliminate_zeros()
     return rounded
 
 
@@ -57,7 +59,11 @@ class DeseqDataSet(ad.AnnData):
     adata : anndata.AnnData
         AnnData from which to initialize the DeseqDataSet. Must have counts ('X') and
         sample metadata ('obs') fields. If ``None``, both ``counts`` and ``metadata``
-        arguments must be provided.
+        arguments must be provided. Compatible pytximport objects with unscaled
+        estimated counts are detected from ``obsm["length"]`` and
+        ``uns["counts_from_abundance"] is None``.
+        Backed AnnData objects are not supported; call ``adata.to_memory()`` before
+        initialization.
 
     counts : pandas.DataFrame
         Raw counts. One column per gene, rows are indexed by sample barcodes.
@@ -74,7 +80,9 @@ class DeseqDataSet(ad.AnnData):
         ``counts``. When provided, PyDESeq2
         constructs gene- and sample-specific normalization factors that correct for
         transcript-length changes as well as library size. Estimated counts are rounded
-        to the nearest integer, matching DESeq2. (default: ``None``).
+        to the nearest integer, matching DESeq2. Explicit lengths take precedence over
+        ``adata.layers["avg_tx_length"]``, which takes precedence over compatible
+        pytximport fields. (default: ``None``).
 
     design : str or pandas.DataFrame
         Model design. Can be either a pandas DataFrame representing a design matrix, or
@@ -253,10 +261,39 @@ class DeseqDataSet(ad.AnnData):
         low_memory: bool = False,
     ) -> None:
         # Initialize the AnnData part
-        has_transcript_lengths = transcript_lengths is not None or (
+        has_stored_transcript_lengths = (
             adata is not None and "avg_tx_length" in adata.layers
         )
+        selected_transcript_lengths: Any = transcript_lengths
+        has_transcript_lengths = (
+            selected_transcript_lengths is not None or has_stored_transcript_lengths
+        )
         if adata is not None:
+            has_pytximport_fields = (
+                "length" in adata.obsm and "counts_from_abundance" in adata.uns
+            )
+            has_transcript_lengths = has_transcript_lengths or has_pytximport_fields
+            counts_from_abundance = adata.uns.get("counts_from_abundance")
+            if counts_from_abundance is not None and has_transcript_lengths:
+                raise ValueError(
+                    "pytximport transcript-length offsets require unscaled "
+                    "estimated counts with "
+                    "adata.uns['counts_from_abundance'] set to None; got "
+                    f"{counts_from_abundance!r}. Abundance-scaled counts must "
+                    "not be combined with transcript-length offsets."
+                )
+            if (
+                has_pytximport_fields
+                and selected_transcript_lengths is None
+                and not has_stored_transcript_lengths
+            ):
+                selected_transcript_lengths = adata.obsm["length"]
+
+            if adata.isbacked:
+                raise ValueError(
+                    "DeseqDataSet requires an in-memory AnnData object. Call "
+                    "adata.to_memory() before initialization."
+                )
             expected_length_index = adata.obs_names
             expected_length_columns = adata.var_names
             if counts is not None:
@@ -267,15 +304,41 @@ class DeseqDataSet(ad.AnnData):
                 warnings.warn(
                     "adata was provided; ignoring metadata.", UserWarning, stacklevel=2
                 )
-            prepared_counts = (
+            prepared_counts: Any = (
                 _rounded_counts(adata.X) if has_transcript_lengths else adata.X
             )
             # Test counts before going further
             test_valid_counts(prepared_counts)
-            # Copy fields from original AnnData
-            self.__dict__.update(adata.__dict__)
-            # Cast counts to ints to avoid any issue
-            self.X = prepared_counts.astype(int)
+            integer_counts = prepared_counts.astype(int)
+            if has_transcript_lengths:
+                # Own the containers PyDESeq2 writes while retaining references to
+                # existing large aligned matrices.
+                # AnnData migrates legacy neighbor matrices out of uns in place.
+                owned_uns = dict(adata.uns)
+                if "neighbors" in owned_uns:
+                    owned_uns["neighbors"] = dict(owned_uns["neighbors"])
+                super().__init__(
+                    X=integer_counts,
+                    obs=cast(pd.DataFrame, adata.obs).copy(),
+                    var=cast(pd.DataFrame, adata.var).copy(),
+                    uns=None,
+                    obsm=cast(Any, dict(adata.obsm)),
+                    varm=cast(Any, dict(adata.varm)),
+                    obsp=cast(Any, dict(adata.obsp)),
+                    varp=cast(Any, dict(adata.varp)),
+                    # AnnData 0.13 can expose X as a None-keyed layer item.
+                    layers={
+                        key: value
+                        for key, value in adata.layers.items()
+                        if key is not None
+                    },
+                    raw=cast(Any, adata.raw),
+                )
+                self.uns.update(owned_uns)
+            else:
+                # Preserve the existing AnnData initialization behavior.
+                self.__dict__.update(adata.__dict__)
+                self.X = integer_counts
         elif counts is not None and metadata is not None:
             expected_length_index = counts.index
             expected_length_columns = counts.columns
@@ -290,25 +353,31 @@ class DeseqDataSet(ad.AnnData):
                 "Either adata or both counts and metadata arguments must be provided."
             )
 
-        if transcript_lengths is not None:
-            if isinstance(transcript_lengths, pd.DataFrame):
-                if not transcript_lengths.index.equals(expected_length_index):
+        if selected_transcript_lengths is not None:
+            if isinstance(selected_transcript_lengths, pd.DataFrame):
+                if not selected_transcript_lengths.index.equals(expected_length_index):
                     raise ValueError(
                         "transcript_lengths must have the same sample index as counts."
                     )
-                if not transcript_lengths.columns.equals(expected_length_columns):
+                if not selected_transcript_lengths.columns.equals(
+                    expected_length_columns
+                ):
                     raise ValueError(
                         "transcript_lengths must have the same gene columns as counts."
                     )
-                transcript_lengths_array = transcript_lengths.to_numpy(dtype=float)
+                transcript_lengths_array = selected_transcript_lengths.to_numpy(
+                    dtype=float, copy=True
+                )
             else:
-                transcript_lengths_array = np.asarray(transcript_lengths, dtype=float)
+                transcript_lengths_array = np.array(
+                    selected_transcript_lengths, dtype=float, copy=True
+                )
             self._validate_transcript_lengths(transcript_lengths_array)
             self.layers["avg_tx_length"] = transcript_lengths_array
         elif "avg_tx_length" in self.layers:
             stored_lengths = self.layers["avg_tx_length"]
             transcript_lengths_array = (
-                stored_lengths.toarray()
+                cast(Any, stored_lengths).toarray()
                 if hasattr(stored_lengths, "toarray")
                 else np.asarray(stored_lengths, dtype=float)
             )
@@ -540,7 +609,7 @@ class DeseqDataSet(ad.AnnData):
         """
         # Start by fitting median-of-ratio size factors if not already present,
         # or if they were computed iteratively
-        if "size_factors" not in self.obsm or self.logmeans is None:
+        if "size_factors" not in self.obs or self.logmeans is None:
             self.fit_size_factors(
                 fit_type=self.size_factors_fit_type
             )  # by default, fit_type != "iterative"
@@ -899,7 +968,7 @@ class DeseqDataSet(ad.AnnData):
             self.fit_size_factors(fit_type=self.size_factors_fit_type)
 
         # Exclude genes with all zeroes
-        self.var["non_zero"] = ~(self.X == 0).all(axis=0)
+        self.var["non_zero"] = np.asarray((self.X != 0).sum(axis=0)).ravel() > 0
         self.non_zero_idx = np.arange(self.n_vars)[self.var["non_zero"]]
         self.non_zero_genes = self.var_names[self.var["non_zero"]]
 
@@ -1185,7 +1254,13 @@ class DeseqDataSet(ad.AnnData):
         )
 
         # Calculate the squared pearson residuals for non-zero features
-        squared_pearson_res = self.X[:, self.var["non_zero"]] - self.obsm["_mu_LFC"]
+        counts = self.X[:, self.non_zero_idx]
+        if hasattr(counts, "tocoo"):
+            counts = counts.tocoo()
+            squared_pearson_res = -self.obsm["_mu_LFC"].copy()
+            np.add.at(squared_pearson_res, (counts.row, counts.col), counts.data)
+        else:
+            squared_pearson_res = counts - self.obsm["_mu_LFC"]
         squared_pearson_res **= 2
 
         # Calculate the overdispersion parameter tau
@@ -1274,11 +1349,13 @@ class DeseqDataSet(ad.AnnData):
                 axis=0
             )
 
-        pos = self.layers["cooks"][:, cooks_outlier].argmax(0)
-
-        cooks_outlier[cooks_outlier] = (
-            self.X[:, cooks_outlier] > self.X[:, cooks_outlier][pos, np.arange(len(pos))]
-        ).sum(axis=0) < 3
+        pos = np.asarray(self.layers["cooks"][:, cooks_outlier].argmax(0)).ravel()
+        for gene_idx, sample_idx in zip(np.flatnonzero(cooks_outlier), pos, strict=True):
+            gene_counts = self.X[:, gene_idx]
+            if hasattr(gene_counts, "toarray"):
+                gene_counts = gene_counts.toarray()
+            gene_counts = np.asarray(gene_counts).ravel()
+            cooks_outlier[gene_idx] = (gene_counts > gene_counts[sample_idx]).sum() < 3
 
         if self.low_memory:
             del self.layers["cooks"]
@@ -1511,6 +1588,8 @@ class DeseqDataSet(ad.AnnData):
         if sum(self.var["replaced"] > 0):
             # Compute replacement counts: trimmed means * normalization factors
             self.counts_to_refit = self[:, self.var["replaced"]].copy()
+            if hasattr(self.counts_to_refit.X, "toarray"):
+                self.counts_to_refit.X = self.counts_to_refit.X.toarray()
             normalization_factors = self._get_normalization_factors()
             if normalization_factors.ndim == 1:
                 normalization_factors = normalization_factors[:, None]

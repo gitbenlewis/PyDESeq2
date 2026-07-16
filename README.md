@@ -111,12 +111,62 @@ dds = DeseqDataSet(
 dds.deseq2()
 ```
 
-Following DESeq2's `DESeqDataSetFromTximport()` workflow, PyDESeq2 rounds estimated
-counts and combines transcript-length offsets with median-of-ratios library-size
-normalization. Average lengths and the resulting sample-by-gene factors are available
-in `dds.layers["avg_tx_length"]` and `dds.layers["normalization_factors"]`.
-The `ratio` and `poscounts` size-factor methods are supported; `iterative` is not
-currently compatible with transcript-length offsets.
+[`pytximport`](https://github.com/complextissue/pytximport), described in [4], can
+produce a compatible AnnData object directly:
+
+```python
+from pydeseq2.dds import DeseqDataSet
+from pytximport import tximport
+
+sample_files = {
+    "sample_1": "sample_1/quant.sf",
+    "sample_2": "sample_2/quant.sf",
+}
+
+txi = tximport(
+    list(sample_files.values()),
+    data_type="salmon",
+    transcript_gene_map=transcript_gene_map,
+    counts_from_abundance=None,
+    output_type="anndata",
+)
+# pytximport uses file paths as observation names. Replace them with metadata
+# rows in the same explicit sample order.
+txi.obs = metadata.loc[list(sample_files)].copy()
+
+dds = DeseqDataSet(adata=txi, design="~condition")
+dds.deseq2()
+```
+
+Direct transcript-length normalization requires an in-memory AnnData object.
+For a backed object, call `adata.to_memory()` before constructing `DeseqDataSet`;
+this materializes the data, so ensure sufficient memory is available.
+
+Only unscaled estimated counts created with `counts_from_abundance=None` may be
+combined with transcript-length offsets. PyDESeq2 rejects abundance-derived modes
+such as `scaled_tpm` and `length_scaled_tpm`, because applying the offset would
+correct for transcript length twice.
+
+After the unscaled-count check succeeds, when multiple length sources are
+available, PyDESeq2 uses an explicit `transcript_lengths` argument first, then
+`adata.layers["avg_tx_length"]`, and finally compatible pytximport fields.
+Pytximport lengths are copied from
+`adata.obsm["length"]` into the canonical `avg_tx_length` layer.
+
+The current pytximport length matrix has no gene labels, and AnnData does not align
+its second `obsm` dimension with `adata.var`. Pass the object before gene-axis
+subsetting or reordering, or apply the same selection and ordering to
+`adata.obsm["length"]`.
+
+Following the
+[`tximport`](https://bioconductor.org/packages/release/bioc/html/tximport.html) and
+[`DESeq2`](https://bioconductor.org/packages/release/bioc/html/DESeq2.html)
+workflow [1, 3], PyDESeq2 rounds estimated counts and combines transcript-length
+offsets with median-of-ratios library-size normalization. Average lengths and the
+resulting sample-by-gene factors are available in `dds.layers["avg_tx_length"]`
+and `dds.layers["normalization_factors"]`. The `ratio` and `poscounts`
+size-factor methods are supported; `iterative` is not currently compatible with
+transcript-length offsets.
 
 
 ### Documentation
@@ -183,6 +233,16 @@ In Dec 2025, the maintenance of PyDESeq2 was taken over by the scverse community
         removing the noise and preserving large differences."
         Bioinformatics, 35(12), 2084-2092.
         <https://academic.oup.com/bioinformatics/article/35/12/2084/5159452>
+
+[3] Soneson, C., Love, M. I., & Robinson, M. D. (2015). "Differential analyses
+        for RNA-seq: transcript-level estimates improve gene-level inferences."
+        F1000Research, 4:1521.
+        <https://doi.org/10.12688/f1000research.7563.1>
+
+[4] Kuehl, M., Wong, M. N., Wanner, N., Bonn, S., & Puelles, V. G. (2024).
+        "Gene count estimation with pytximport enables reproducible analysis of
+        bulk RNA sequencing data in Python." Bioinformatics, 40(12), btae700.
+        <https://doi.org/10.1093/bioinformatics/btae700>
 
 ## License
 

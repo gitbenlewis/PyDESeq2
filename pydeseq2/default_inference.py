@@ -18,6 +18,14 @@ def _gene_factors(factors: np.ndarray, gene_idx: int) -> np.ndarray:
     return factors
 
 
+def _gene_counts(counts: np.ndarray, gene_idx: int) -> np.ndarray:
+    """Return one gene's counts as a dense sample vector."""
+    column = counts[:, gene_idx]
+    if hasattr(column, "toarray"):
+        column = column.toarray()
+    return np.asarray(column).ravel()
+
+
 class DefaultInference(inference.Inference):
     """Default DESeq2-related inference methods, using scipy/sklearn/numpy.
 
@@ -69,6 +77,7 @@ class DefaultInference(inference.Inference):
         design_matrix: np.ndarray,
         min_mu: float,
     ) -> np.ndarray:
+        counts = counts.tocsc(copy=False) if hasattr(counts, "tocsc") else counts
         with parallel_backend(self._backend, inner_max_num_threads=1):
             mu_hat_ = np.array(
                 Parallel(
@@ -77,7 +86,7 @@ class DefaultInference(inference.Inference):
                     batch_size=self._batch_size,
                 )(
                     delayed(utils.fit_lin_mu)(
-                        counts=counts[:, i],
+                        counts=_gene_counts(counts, i),
                         size_factors=_gene_factors(size_factors, i),
                         design_matrix=design_matrix,
                         min_mu=min_mu,
@@ -100,6 +109,7 @@ class DefaultInference(inference.Inference):
         optimizer: Literal["BFGS", "L-BFGS-B"] = "L-BFGS-B",
         maxiter: int = 250,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        counts = counts.tocsc(copy=False) if hasattr(counts, "tocsc") else counts
         with parallel_backend(self._backend, inner_max_num_threads=1):
             res = Parallel(
                 n_jobs=self.n_cpus,
@@ -107,7 +117,7 @@ class DefaultInference(inference.Inference):
                 batch_size=self._batch_size,
             )(
                 delayed(utils.irls_solver)(
-                    counts=counts[:, i],
+                    counts=_gene_counts(counts, i),
                     size_factors=_gene_factors(size_factors, i),
                     design_matrix=design_matrix,
                     disp=disp[i],
@@ -143,6 +153,7 @@ class DefaultInference(inference.Inference):
         prior_reg: bool = False,
         optimizer: Literal["BFGS", "L-BFGS-B"] = "L-BFGS-B",
     ) -> tuple[np.ndarray, np.ndarray]:
+        counts = counts.tocsc(copy=False) if hasattr(counts, "tocsc") else counts
         with parallel_backend(self._backend, inner_max_num_threads=1):
             res = Parallel(
                 n_jobs=self.n_cpus,
@@ -150,7 +161,7 @@ class DefaultInference(inference.Inference):
                 batch_size=self._batch_size,
             )(
                 delayed(utils.fit_alpha_mle)(
-                    counts=counts[:, i],
+                    counts=_gene_counts(counts, i),
                     design_matrix=design_matrix,
                     mu=mu[:, i],
                     alpha_hat=alpha_hat[i],
@@ -247,6 +258,7 @@ class DefaultInference(inference.Inference):
         optimizer: str,
         shrink_index: int,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        counts = counts.tocsc(copy=False) if hasattr(counts, "tocsc") else counts
         with parallel_backend(self._backend, inner_max_num_threads=1):
             num_genes = counts.shape[1]
             res = Parallel(
@@ -256,7 +268,7 @@ class DefaultInference(inference.Inference):
             )(
                 delayed(utils.nbinomGLM)(
                     design_matrix=design_matrix,
-                    counts=counts[:, i],
+                    counts=_gene_counts(counts, i),
                     size=size[i],
                     offset=_gene_factors(offset, i),
                     prior_no_shrink_scale=prior_no_shrink_scale,
