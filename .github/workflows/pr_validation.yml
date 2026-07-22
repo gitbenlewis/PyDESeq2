@@ -46,6 +46,7 @@ jobs:
         run: |
           uv run ruff format --check pydeseq2
       - name: Type check with mypy
+        if: matrix.python == '3.11'
         run: |
           uv run mypy -p pydeseq2
       - name: Test with pytest
