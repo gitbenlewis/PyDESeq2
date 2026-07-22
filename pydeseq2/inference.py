@@ -4,6 +4,10 @@ from typing import Literal
 
 import numpy as np
 import pandas as pd
+from scipy.sparse import sparray
+from scipy.sparse import spmatrix
+
+CountMatrix = np.ndarray | spmatrix | sparray
 
 
 class Inference(ABC):
@@ -12,7 +16,7 @@ class Inference(ABC):
     @abstractmethod
     def lin_reg_mu(
         self,
-        counts: np.ndarray,
+        counts: CountMatrix,
         size_factors: np.ndarray,
         design_matrix: np.ndarray,
         min_mu: float,
@@ -23,12 +27,14 @@ class Inference(ABC):
 
         Parameters
         ----------
-        counts : ndarray
-            Raw counts.
+        counts : ndarray or scipy.sparse.spmatrix or scipy.sparse.sparray
+            Raw count matrix.
 
         size_factors : ndarray
-            Sample-wise scaling factors, or sample-by-gene normalization factors
-            (obtained from median-of-ratios and optional gene-specific offsets).
+            Sample-wise scaling factors with shape ``(n_samples,)``, or
+            sample-by-gene normalization factors with shape
+            ``(n_samples, n_genes)`` (obtained from median-of-ratios and optional
+            gene-specific offsets).
 
         design_matrix : ndarray
             Design matrix.
@@ -46,7 +52,7 @@ class Inference(ABC):
     @abstractmethod
     def irls(
         self,
-        counts: np.ndarray,
+        counts: CountMatrix,
         size_factors: np.ndarray,
         design_matrix: np.ndarray,
         disp: np.ndarray,
@@ -63,12 +69,14 @@ class Inference(ABC):
 
         Parameters
         ----------
-        counts : ndarray
-            Raw counts.
+        counts : ndarray or scipy.sparse.spmatrix or scipy.sparse.sparray
+            Raw count matrix.
 
         size_factors : ndarray
-            Sample-wise scaling factors, or sample-by-gene normalization factors
-            (obtained from median-of-ratios and optional gene-specific offsets).
+            Sample-wise scaling factors with shape ``(n_samples,)``, or
+            sample-by-gene normalization factors with shape
+            ``(n_samples, n_genes)`` (obtained from median-of-ratios and optional
+            gene-specific offsets).
 
         design_matrix : ndarray
             Design matrix.
@@ -122,7 +130,7 @@ class Inference(ABC):
     @abstractmethod
     def alpha_mle(
         self,
-        counts: np.ndarray,
+        counts: CountMatrix,
         design_matrix: np.ndarray,
         mu: np.ndarray,
         alpha_hat: np.ndarray,
@@ -137,8 +145,8 @@ class Inference(ABC):
 
         Parameters
         ----------
-        counts : ndarray
-            Raw counts.
+        counts : ndarray or scipy.sparse.spmatrix or scipy.sparse.sparray
+            Raw count matrix.
 
         design_matrix : ndarray
             Design matrix.
@@ -274,7 +282,9 @@ class Inference(ABC):
             Array of deseq2-normalized read counts. Rows: samples, columns: genes.
 
         size_factors : ndarray
-            DESeq2 normalization factors.
+            Sample-wise scaling factors with shape ``(n_samples,)``, or
+            sample-by-gene normalization factors with shape
+            ``(n_samples, n_genes)``.
 
         Returns
         -------
@@ -312,7 +322,7 @@ class Inference(ABC):
     def lfc_shrink_nbinom_glm(
         self,
         design_matrix: np.ndarray,
-        counts: np.ndarray,
+        counts: CountMatrix,
         size: np.ndarray,
         offset: np.ndarray,
         prior_no_shrink_scale: float,
@@ -329,14 +339,16 @@ class Inference(ABC):
         design_matrix : ndarray
             Design matrix.
 
-        counts : ndarray
-            Raw counts.
+        counts : ndarray or scipy.sparse.spmatrix or scipy.sparse.sparray
+            Raw count matrix.
 
         size : ndarray
             Size parameter of NB family (inverse of dispersion).
 
         offset : ndarray
-            Natural logarithm of size factor.
+            Natural logarithm of sample-wise size factors with shape
+            ``(n_samples,)``, or sample-by-gene normalization factors with shape
+            ``(n_samples, n_genes)``.
 
         prior_no_shrink_scale : float
             Prior variance for the intercept.

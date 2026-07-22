@@ -4,7 +4,9 @@ import anndata as ad
 import numpy as np
 import pandas as pd
 import pytest
+from scipy.sparse import csc_array
 from scipy.sparse import csc_matrix
+from scipy.sparse import csr_array
 from scipy.sparse import csr_matrix
 
 from pydeseq2.dds import DeseqDataSet
@@ -265,6 +267,154 @@ def test_transcript_length_factors_are_used_throughout_pipeline(
     assert isinstance(dds.X, sparse_constructor)
 
 
+@pytest.mark.parametrize(
+    "sparse_constructor", [csr_matrix, csc_matrix, csr_array, csc_array]
+)
+def test_sparse_anndata_ratio_pipeline_matches_dense(sparse_constructor):
+    counts = load_example_data("raw_counts", "synthetic", debug=False)
+    metadata = load_example_data("metadata", "synthetic", debug=False)
+    adata = ad.AnnData(
+        X=sparse_constructor(counts.to_numpy()),
+        obs=metadata.copy(),
+        var=pd.DataFrame(index=counts.columns),
+    )
+
+    dds = DeseqDataSet(
+        adata=adata,
+        design="~0 + condition",
+        fit_type="mean",
+        refit_cooks=False,
+        n_cpus=1,
+        quiet=True,
+    )
+    reference_dds = DeseqDataSet(
+        counts=counts,
+        metadata=metadata,
+        design="~0 + condition",
+        fit_type="mean",
+        refit_cooks=False,
+        n_cpus=1,
+        quiet=True,
+    )
+    dds.deseq2()
+    reference_dds.deseq2()
+
+    np.testing.assert_allclose(
+        dds.obs["size_factors"], reference_dds.obs["size_factors"]
+    )
+    np.testing.assert_allclose(
+        dds.layers["normed_counts"], reference_dds.layers["normed_counts"]
+    )
+    dispersion_columns = ["_MoM_dispersions", "genewise_dispersions", "dispersions"]
+    np.testing.assert_allclose(
+        dds.var[dispersion_columns], reference_dds.var[dispersion_columns]
+    )
+    np.testing.assert_allclose(dds.varm["LFC"], reference_dds.varm["LFC"])
+    assert isinstance(dds.X, sparse_constructor)
+
+
+@pytest.mark.parametrize(
+    "sparse_constructor", [csr_matrix, csc_matrix, csr_array, csc_array]
+)
+def test_sparse_anndata_poscounts_size_factors_match_dense(sparse_constructor):
+    counts, metadata, _ = small_tximport_data()
+    counts = counts.round().astype(int)
+    for idx in range(counts.shape[1]):
+        counts.iat[idx, idx] = 0
+    adata = ad.AnnData(
+        X=sparse_constructor(counts.to_numpy()),
+        obs=metadata.copy(),
+        var=pd.DataFrame(index=counts.columns),
+    )
+    dds = DeseqDataSet(adata=adata, design="~condition", quiet=True)
+    reference_dds = DeseqDataSet(
+        counts=counts,
+        metadata=metadata,
+        design="~condition",
+        quiet=True,
+    )
+
+    dds.fit_size_factors("poscounts")
+    reference_dds.fit_size_factors("poscounts")
+
+    np.testing.assert_allclose(
+        dds.obs["size_factors"], reference_dds.obs["size_factors"]
+    )
+    np.testing.assert_allclose(
+        dds.layers["normed_counts"], reference_dds.layers["normed_counts"]
+    )
+    assert isinstance(dds.layers["normed_counts"], np.ndarray)
+    assert isinstance(dds.X, sparse_constructor)
+
+
+@pytest.mark.parametrize(
+    "sparse_constructor", [csr_matrix, csc_matrix, csr_array, csc_array]
+)
+def test_sparse_anndata_iterative_size_factors_match_dense(sparse_constructor):
+    counts = load_example_data("raw_counts", "synthetic", debug=False).iloc[:20]
+    metadata = load_example_data("metadata", "synthetic", debug=False).loc[counts.index]
+    adata = ad.AnnData(
+        X=sparse_constructor(counts.to_numpy()),
+        obs=metadata.copy(),
+        var=pd.DataFrame(index=counts.columns),
+    )
+    dds = DeseqDataSet(adata=adata, design="~1", n_cpus=1, quiet=True)
+    reference_dds = DeseqDataSet(
+        counts=counts,
+        metadata=metadata,
+        design="~1",
+        n_cpus=1,
+        quiet=True,
+    )
+    for dataset in (dds, reference_dds):
+        dataset.logmeans = np.ones(dataset.n_vars)
+        dataset.filtered_genes = np.ones(dataset.n_vars, dtype=bool)
+        dataset._fit_iterate_size_factors(niter=1)
+
+    np.testing.assert_allclose(
+        dds.obs["size_factors"], reference_dds.obs["size_factors"]
+    )
+    np.testing.assert_allclose(
+        dds.layers["normed_counts"], reference_dds.layers["normed_counts"]
+    )
+    assert dds.logmeans is None
+    assert dds.filtered_genes is None
+    assert isinstance(dds.layers["normed_counts"], np.ndarray)
+    assert isinstance(dds.X, sparse_constructor)
+
+
+@pytest.mark.parametrize(
+    "sparse_constructor", [csr_matrix, csc_matrix, csr_array, csc_array]
+)
+def test_sparse_ratio_falls_back_to_iterative(monkeypatch, sparse_constructor):
+    counts, metadata, _ = small_tximport_data()
+    counts = counts.round().astype(int)
+    for idx in range(counts.shape[1]):
+        counts.iat[idx, idx] = 0
+    adata = ad.AnnData(
+        X=sparse_constructor(counts.to_numpy()),
+        obs=metadata.copy(),
+        var=pd.DataFrame(index=counts.columns),
+    )
+    dds = DeseqDataSet(adata=adata, design="~condition", quiet=True)
+    iterative_called = False
+
+    def fit_iterative():
+        nonlocal iterative_called
+        iterative_called = True
+        dds.obs["size_factors"] = np.ones(dds.n_obs)
+        dds.layers["normed_counts"] = dds.X.toarray()
+        dds.logmeans = None
+        dds.filtered_genes = None
+
+    monkeypatch.setattr(dds, "_fit_iterate_size_factors", fit_iterative)
+
+    with pytest.warns(UserWarning, match="Switching to iterative mode"):
+        dds.fit_size_factors("ratio")
+
+    assert iterative_called
+
+
 def test_moments_dispersions_match_deseq2_with_matrix_factors():
     counts, metadata, transcript_lengths = small_tximport_data()
     dds = DeseqDataSet(
@@ -285,6 +435,28 @@ def test_moments_dispersions_match_deseq2_with_matrix_factors():
     np.testing.assert_allclose(
         fit_moments_dispersions(normed_counts, normalization_factors),
         expected,
+    )
+
+
+def test_moments_dispersions_align_matrix_factors_after_zero_gene_filtering():
+    normed_counts = np.array(
+        [
+            [0.0, 10.0],
+            [0.0, 14.0],
+            [0.0, 18.0],
+        ]
+    )
+    normalization_factors = np.array(
+        [
+            [100.0, 1.0],
+            [100.0, 1.0],
+            [100.0, 1.0],
+        ]
+    )
+
+    np.testing.assert_allclose(
+        fit_moments_dispersions(normed_counts, normalization_factors),
+        np.array([2.0 / 196.0]),
     )
 
 
@@ -364,6 +536,161 @@ def test_scalar_size_factor_refit_clears_stale_matrix_factors():
         dds.layers["normed_counts"],
         dds.X / dds.obs["size_factors"].to_numpy()[:, None],
     )
+
+
+def test_explicit_transcript_lengths_clear_inherited_normalization_state():
+    counts, metadata, transcript_lengths = small_tximport_data()
+    fitted_dds = DeseqDataSet(
+        counts=counts,
+        metadata=metadata,
+        transcript_lengths=transcript_lengths,
+        quiet=True,
+    )
+    fitted_dds.fit_size_factors()
+    original_size_factors = fitted_dds.obs["size_factors"].copy()
+    original_normalization_factors = fitted_dds.layers["normalization_factors"].copy()
+    original_normed_counts = fitted_dds.layers["normed_counts"].copy()
+
+    replacement_lengths = transcript_lengths.copy()
+    replacement_lengths.iloc[:, 0] *= np.linspace(1.0, 2.0, len(replacement_lengths))
+    dds = DeseqDataSet(
+        adata=fitted_dds,
+        transcript_lengths=replacement_lengths,
+        quiet=True,
+    )
+
+    assert "size_factors" not in dds.obs
+    assert "normalization_factors" not in dds.layers
+    assert "normed_counts" not in dds.layers
+    np.testing.assert_allclose(fitted_dds.obs["size_factors"], original_size_factors)
+    np.testing.assert_allclose(
+        fitted_dds.layers["normalization_factors"],
+        original_normalization_factors,
+    )
+    np.testing.assert_allclose(
+        fitted_dds.layers["normed_counts"], original_normed_counts
+    )
+
+    reference_dds = DeseqDataSet(
+        counts=counts,
+        metadata=metadata,
+        transcript_lengths=replacement_lengths,
+        quiet=True,
+    )
+    dds.fit_genewise_dispersions()
+    reference_dds.fit_size_factors()
+
+    np.testing.assert_allclose(
+        dds.obs["size_factors"], reference_dds.obs["size_factors"]
+    )
+    np.testing.assert_allclose(
+        dds.layers["normalization_factors"],
+        reference_dds.layers["normalization_factors"],
+    )
+    np.testing.assert_allclose(
+        dds.layers["normed_counts"], reference_dds.layers["normed_counts"]
+    )
+
+
+def test_explicit_transcript_lengths_clear_inherited_fitted_state():
+    counts = load_example_data("raw_counts", "synthetic", debug=False)
+    metadata = load_example_data("metadata", "synthetic", debug=False)
+    transcript_lengths = varying_transcript_lengths(counts)
+    fitted_dds = DeseqDataSet(
+        counts=counts,
+        metadata=metadata,
+        transcript_lengths=transcript_lengths,
+        design="~0 + condition",
+        fit_type="mean",
+        refit_cooks=False,
+        n_cpus=1,
+        quiet=True,
+    )
+    fitted_dds.deseq2()
+
+    replacement_lengths = transcript_lengths.copy()
+    replacement_lengths.iloc[:, 0] *= np.linspace(1.0, 2.0, len(replacement_lengths))
+    dds = DeseqDataSet(
+        adata=fitted_dds,
+        transcript_lengths=replacement_lengths,
+        design="~0 + condition",
+        fit_type="mean",
+        refit_cooks=False,
+        n_cpus=1,
+        quiet=True,
+    )
+
+    assert set(dds.obs.columns).isdisjoint({"size_factors", "replaceable"})
+    assert set(dds.var.columns).isdisjoint(
+        {
+            "_normed_means",
+            "non_zero",
+            "_MoM_dispersions",
+            "genewise_dispersions",
+            "vst_genewise_dispersions",
+            "_genewise_converged",
+            "fitted_dispersions",
+            "MAP_dispersions",
+            "_MAP_converged",
+            "dispersions",
+            "_outlier_genes",
+            "_LFC_converged",
+            "_pvalue_cooks_outlier",
+            "replaced",
+            "refitted",
+        }
+    )
+    assert set(dds.obsm).isdisjoint({"_mu_LFC", "_hat_diagonals"})
+    assert "LFC" not in dds.varm
+    assert set(dds.layers).isdisjoint(
+        {
+            "normalization_factors",
+            "normed_counts",
+            "_mu_hat",
+            "_vst_mu_hat",
+            "cooks",
+            "replace_cooks",
+            "vst_counts",
+        }
+    )
+    assert set(dds.uns).isdisjoint(
+        {
+            "trend_coeffs",
+            "vst_trend_coeffs",
+            "mean_disp",
+            "disp_function_type",
+            "_squared_logres",
+            "prior_disp_var",
+        }
+    )
+    assert "size_factors" in fitted_dds.obs
+    assert "genewise_dispersions" in fitted_dds.var
+    assert "_mu_LFC" in fitted_dds.obsm
+    assert "LFC" in fitted_dds.varm
+    assert "cooks" in fitted_dds.layers
+    assert "mean_disp" in fitted_dds.uns
+
+    reference_dds = DeseqDataSet(
+        counts=counts,
+        metadata=metadata,
+        transcript_lengths=replacement_lengths,
+        design="~0 + condition",
+        fit_type="mean",
+        refit_cooks=False,
+        n_cpus=1,
+        quiet=True,
+    )
+    dds.fit_dispersion_trend()
+    reference_dds.fit_dispersion_trend()
+    dds.fit_LFC()
+    reference_dds.fit_LFC()
+
+    np.testing.assert_allclose(
+        dds.layers["normalization_factors"],
+        reference_dds.layers["normalization_factors"],
+    )
+    np.testing.assert_allclose(dds.var["dispersions"], reference_dds.var["dispersions"])
+    np.testing.assert_allclose(dds.varm["LFC"], reference_dds.varm["LFC"])
 
 
 @pytest.mark.parametrize("sparse_constructor", [csr_matrix, csc_matrix])

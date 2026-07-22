@@ -24,6 +24,7 @@ In case there is a feature you would particularly like to be implemented, feel f
   - [Installation](#installation)
     - [Requirements](#requirements)
   - [Getting started](#getting-started)
+    - [Transcript-length normalization](#transcript-length-normalization)
     - [Documentation](#documentation)
     - [Data](#data)
   - [Contributing](#contributing)

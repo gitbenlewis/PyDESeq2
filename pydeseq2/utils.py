@@ -11,7 +11,8 @@ import pandas as pd
 from matplotlib import pyplot as plt
 from scipy.linalg import solve  # type: ignore
 from scipy.optimize import minimize  # type: ignore
-from scipy.sparse import issparse  # type: ignore
+from scipy.sparse import sparray  # type: ignore
+from scipy.sparse import spmatrix  # type: ignore
 from scipy.special import gammaln  # type: ignore
 from scipy.special import polygamma  # type: ignore
 from scipy.stats import norm  # type: ignore
@@ -109,14 +110,16 @@ def load_example_data(
     return df
 
 
-def test_valid_counts(counts: pd.DataFrame | np.ndarray) -> None:
+def test_valid_counts(
+    counts: pd.DataFrame | np.ndarray | spmatrix | sparray,
+) -> None:
     """Test that the count matrix contains valid inputs.
 
     More precisely, test that inputs are non-negative integers.
 
     Parameters
     ----------
-    counts : pandas.DataFrame, ndarray or scipy.sparse.spmatrix
+    counts : pandas.DataFrame, ndarray, scipy.sparse.spmatrix or scipy.sparse.sparray
         Raw counts. One column per gene, rows are indexed by sample barcodes.
     """
     if isinstance(counts, pd.DataFrame):
@@ -124,7 +127,7 @@ def test_valid_counts(counts: pd.DataFrame | np.ndarray) -> None:
             raise ValueError("NaNs are not allowed in the count matrix.")
         if not np.issubdtype(counts.to_numpy().dtype, np.number):
             raise ValueError("The count matrix should only contain numbers.")
-    elif issparse(counts):
+    elif isinstance(counts, (spmatrix, sparray)):
         values = np.asarray(cast(Any, counts).data)
         if not np.issubdtype(values.dtype, np.number):
             raise ValueError("The count matrix should only contain numbers.")
@@ -888,13 +891,15 @@ def fit_moments_dispersions(
         Estimated dispersion parameter for each gene.
     """
     # Exclude genes with all zeroes
-    normed_counts = normed_counts[:, ~(normed_counts == 0).all(axis=0)]
+    nonzero_genes = ~(normed_counts == 0).all(axis=0)
+    normed_counts = normed_counts[:, nonzero_genes]
     # Mean inverse size factor. For gene-specific normalization factors, DESeq2
     # first averages factors across genes within each sample, then averages the
     # inverse sample means into one scalar shared by all genes.
     if size_factors.ndim == 1:
         s_mean_inv = (1 / size_factors).mean()
     else:
+        size_factors = size_factors[:, nonzero_genes]
         s_mean_inv = (1 / size_factors.mean(axis=1)).mean()
     mu = normed_counts.mean(0)
     sigma = normed_counts.var(0, ddof=1)

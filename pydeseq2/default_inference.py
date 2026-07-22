@@ -1,4 +1,5 @@
 from typing import Literal
+from typing import cast
 
 import numpy as np
 import pandas as pd
@@ -72,12 +73,15 @@ class DefaultInference(inference.Inference):
 
     def lin_reg_mu(  # noqa: D102
         self,
-        counts: np.ndarray,
+        counts: inference.CountMatrix,
         size_factors: np.ndarray,
         design_matrix: np.ndarray,
         min_mu: float,
     ) -> np.ndarray:
-        counts = counts.tocsc(copy=False) if hasattr(counts, "tocsc") else counts
+        counts = cast(
+            np.ndarray,
+            counts.tocsc(copy=False) if hasattr(counts, "tocsc") else counts,
+        )
         with parallel_backend(self._backend, inner_max_num_threads=1):
             mu_hat_ = np.array(
                 Parallel(
@@ -98,7 +102,7 @@ class DefaultInference(inference.Inference):
 
     def irls(  # noqa: D102
         self,
-        counts: np.ndarray,
+        counts: inference.CountMatrix,
         size_factors: np.ndarray,
         design_matrix: np.ndarray,
         disp: np.ndarray,
@@ -109,7 +113,10 @@ class DefaultInference(inference.Inference):
         optimizer: Literal["BFGS", "L-BFGS-B"] = "L-BFGS-B",
         maxiter: int = 250,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        counts = counts.tocsc(copy=False) if hasattr(counts, "tocsc") else counts
+        counts = cast(
+            np.ndarray,
+            counts.tocsc(copy=False) if hasattr(counts, "tocsc") else counts,
+        )
         with parallel_backend(self._backend, inner_max_num_threads=1):
             res = Parallel(
                 n_jobs=self.n_cpus,
@@ -142,7 +149,7 @@ class DefaultInference(inference.Inference):
 
     def alpha_mle(  # noqa: D102
         self,
-        counts: np.ndarray,
+        counts: inference.CountMatrix,
         design_matrix: np.ndarray,
         mu: np.ndarray,
         alpha_hat: np.ndarray,
@@ -153,7 +160,10 @@ class DefaultInference(inference.Inference):
         prior_reg: bool = False,
         optimizer: Literal["BFGS", "L-BFGS-B"] = "L-BFGS-B",
     ) -> tuple[np.ndarray, np.ndarray]:
-        counts = counts.tocsc(copy=False) if hasattr(counts, "tocsc") else counts
+        counts = cast(
+            np.ndarray,
+            counts.tocsc(copy=False) if hasattr(counts, "tocsc") else counts,
+        )
         with parallel_backend(self._backend, inner_max_num_threads=1):
             res = Parallel(
                 n_jobs=self.n_cpus,
@@ -250,7 +260,7 @@ class DefaultInference(inference.Inference):
     def lfc_shrink_nbinom_glm(  # noqa: D102
         self,
         design_matrix: np.ndarray,
-        counts: np.ndarray,
+        counts: inference.CountMatrix,
         size: np.ndarray,
         offset: np.ndarray,
         prior_no_shrink_scale: float,
@@ -258,7 +268,10 @@ class DefaultInference(inference.Inference):
         optimizer: str,
         shrink_index: int,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        counts = counts.tocsc(copy=False) if hasattr(counts, "tocsc") else counts
+        counts = cast(
+            np.ndarray,
+            counts.tocsc(copy=False) if hasattr(counts, "tocsc") else counts,
+        )
         with parallel_backend(self._backend, inner_max_num_threads=1):
             num_genes = counts.shape[1]
             res = Parallel(
