@@ -26,16 +26,20 @@ class CountingInference(DefaultInference):
     def __init__(self) -> None:
         super().__init__(n_cpus=1)
         self.irls_inputs: list[tuple[np.ndarray, np.ndarray]] = []
+        self.irls_size_factors: list[np.ndarray] = []
 
     def irls(self, *args: Any, **kwargs: Any):
-        """Record counts and design matrix, then run the default IRLS fit."""
+        """Record counts, normalization factors, and design before fitting."""
         counts = kwargs.get("counts", args[0] if args else None)
+        size_factors = kwargs.get("size_factors", args[1] if len(args) > 1 else None)
         design_matrix = kwargs.get("design_matrix", args[2] if len(args) > 2 else None)
         assert counts is not None
+        assert size_factors is not None
         assert design_matrix is not None
         self.irls_inputs.append(
             (np.asarray(counts).copy(), np.asarray(design_matrix).copy())
         )
+        self.irls_size_factors.append(np.asarray(size_factors).copy())
         return super().irls(*args, **kwargs)
 
 
@@ -166,6 +170,46 @@ def test_dds_lrt_cache_is_reused_by_stats(counts_df, metadata):
     assert len(inference.irls_inputs) == calls_after_dds_fit
     np.testing.assert_allclose(stats.statistics, dds.var["_lrt_statistic"])
     np.testing.assert_allclose(stats.p_values, dds.var["_lrt_pvalue"])
+
+
+def test_lrt_uses_transcript_length_normalization_factors(counts_df, metadata):
+    """Both LRT fits and its cache use gene-specific normalization factors."""
+    sample_effect = np.linspace(-1.0, 1.0, counts_df.shape[0])
+    gene_effect = np.linspace(-1.0, 1.0, counts_df.shape[1])
+    lengths = (800.0 + 100.0 * np.arange(counts_df.shape[1]))[None, :]
+    lengths = lengths * (1.0 + 0.2 * np.outer(sample_effect, gene_effect))
+    transcript_lengths = pd.DataFrame(
+        lengths,
+        index=counts_df.index,
+        columns=counts_df.columns,
+    )
+    inference = CountingInference()
+    dds = DeseqDataSet(
+        counts=counts_df.copy(),
+        metadata=metadata.copy(),
+        transcript_lengths=transcript_lengths,
+        design="~condition",
+        inference=inference,
+        refit_cooks=False,
+        quiet=True,
+    )
+
+    dds.deseq2(test="LRT", reduced="~1")
+
+    expected = np.asarray(dds.layers["normalization_factors"])[:, dds.non_zero_idx]
+    assert len(inference.irls_size_factors) == 2
+    for normalization_factors in inference.irls_size_factors:
+        assert normalization_factors.ndim == 2
+        np.testing.assert_allclose(normalization_factors, expected)
+    assert dds._lrt_fit_state_matches()
+
+    original = np.asarray(dds.layers["normalization_factors"]).copy()
+    changed = original.copy()
+    changed[0, 0] *= 1.01
+    dds.layers["normalization_factors"] = changed
+    assert not dds._lrt_fit_state_matches()
+    dds.layers["normalization_factors"] = original
+    assert dds._lrt_fit_state_matches()
 
 
 def test_stats_lrt_on_demand_is_cached(counts_df, metadata):
