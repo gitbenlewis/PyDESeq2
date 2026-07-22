@@ -1,13 +1,14 @@
 from abc import ABC
 from abc import abstractmethod
 from typing import Literal
+from typing import TypeAlias
 
 import numpy as np
 import pandas as pd
 from scipy.sparse import sparray
 from scipy.sparse import spmatrix
 
-CountMatrix = np.ndarray | spmatrix | sparray
+CountMatrix: TypeAlias = np.ndarray | spmatrix | sparray
 
 
 class Inference(ABC):
