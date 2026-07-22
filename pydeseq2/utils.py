@@ -116,7 +116,7 @@ def test_valid_counts(counts: pd.DataFrame | np.ndarray) -> None:
 
     Parameters
     ----------
-    counts : pandas.DataFrame, ndarray or scipy sparse matrix
+    counts : pandas.DataFrame, ndarray or scipy.sparse.spmatrix
         Raw counts. One column per gene, rows are indexed by sample barcodes.
     """
     if isinstance(counts, pd.DataFrame):
