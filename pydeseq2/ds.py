@@ -270,6 +270,10 @@ class DeseqStats:
         else:
             self.inference = DefaultInference(n_cpus=n_cpus)
 
+        self._force_local_lrt_refit = (
+            inference is not None and inference is not self.dds.inference
+        )
+
         if n_cpus is not None and (inference is not None or self.test == "LRT"):
             if hasattr(self.inference, "n_cpus"):
                 self.inference.n_cpus = n_cpus
@@ -455,9 +459,8 @@ class DeseqStats:
         if getattr(self, "_lrt_has_run", False):
             return
 
-        use_dds_cache = (
-            self.inference is self.dds.inference
-            and self.dds._lrt_cache_matches(self.reduced_design_matrix)
+        use_dds_cache = not self._force_local_lrt_refit and self.dds._lrt_cache_matches(
+            self.reduced_design_matrix
         )
         if use_dds_cache:
             results = self.dds._load_lrt_results()
@@ -468,6 +471,7 @@ class DeseqStats:
             results = self.dds._compute_lrt(
                 self.reduced_design_matrix,
                 inference=self.inference,
+                refit_full=self._force_local_lrt_refit,
             )
             if not self.quiet:
                 print(

@@ -3,6 +3,7 @@ import sys
 import time
 import warnings
 from collections.abc import Mapping
+from typing import Any
 from typing import Literal
 from typing import Protocol
 from typing import cast
@@ -747,6 +748,19 @@ class DeseqDataSet(ad.AnnData):
                     f"Could not build the reduced design from {reduced!r}: {error}"
                 ) from error
 
+            try:
+                reduced_variables = set(reduced_contrasts.variables)
+            except KeyError:
+                reduced_variables = set()
+            full_variables = set(self.variables)
+            extra_variables = sorted(
+                str(variable) for variable in reduced_variables - full_variables
+            )
+            if extra_variables:
+                raise ValueError(
+                    "The reduced design contains variables not present in the full "
+                    f"design: {', '.join(extra_variables)}."
+                )
             reduced_matrix = reduced_contrasts.design_matrix
         else:
             if not isinstance(reduced, pd.DataFrame):
@@ -784,8 +798,7 @@ class DeseqDataSet(ad.AnnData):
             raise ValueError("The reduced design matrix is not full column rank.")
 
         full_values = np.asarray(self.obsm["design_matrix"], dtype=float)
-        full_rank = np.linalg.matrix_rank(full_values)
-        if full_rank < full_values.shape[1]:
+        if np.linalg.matrix_rank(full_values) < full_values.shape[1]:
             raise ValueError("The full design matrix is not full column rank.")
         if full_values.shape[1] <= reduced_values.shape[1]:
             raise ValueError(
@@ -796,7 +809,7 @@ class DeseqDataSet(ad.AnnData):
         augmented_rank = np.linalg.matrix_rank(
             np.column_stack((full_values, reduced_values))
         )
-        if augmented_rank != full_rank:
+        if augmented_rank != np.linalg.matrix_rank(full_values):
             raise ValueError("The reduced model is not nested within the full model.")
 
         return pd.DataFrame(
@@ -905,7 +918,7 @@ class DeseqDataSet(ad.AnnData):
         digest.update(encoded_label)
         digest.update(len(shape).to_bytes(8, "little"))
         digest.update(shape)
-        digest.update(memoryview(array).cast("B"))
+        digest.update(array.data.cast("B"))
 
     @staticmethod
     def _update_lrt_text_digest(
@@ -962,8 +975,8 @@ class DeseqDataSet(ad.AnnData):
         )
         self._update_lrt_array_digest(
             digest,
-            "size_factors",
-            self.obs["size_factors"].to_numpy(dtype=float),
+            "normalization_factors",
+            self._get_normalization_factors(),
             "float",
         )
         self._update_lrt_array_digest(
@@ -1227,8 +1240,8 @@ class DeseqDataSet(ad.AnnData):
         if _LRT_FULL_LFC_KEY in self.varm:
             del self.varm[_LRT_FULL_LFC_KEY]
 
-        if discard_replace_counts and _LRT_REPLACE_COUNTS_LAYER in self.layers:
-            del self.layers[_LRT_REPLACE_COUNTS_LAYER]
+        if discard_replace_counts:
+            self._discard_owned_replace_counts()
 
     def _effective_counts(self) -> np.ndarray:
         """Return the counts used for final inference, including Cook replacements."""
@@ -1245,6 +1258,8 @@ class DeseqDataSet(ad.AnnData):
         self,
         reduced_design: pd.DataFrame,
         inference: Inference | None = None,
+        *,
+        refit_full: bool = False,
     ) -> tuple[
         pd.Series,
         pd.Series,
@@ -1254,7 +1269,7 @@ class DeseqDataSet(ad.AnnData):
         pd.Series,
         pd.DataFrame,
     ]:
-        """Fit full and reduced NB GLMs and compute an unpenalized LRT."""
+        """Fit a reduced NB GLM and compute a classical unpenalized LRT."""
         if "LFC" not in self.varm or "dispersions" not in self.var:
             raise RuntimeError(
                 "LRT requires fitted dispersions and LFCs. Run dds.deseq2() first."
@@ -1284,6 +1299,8 @@ class DeseqDataSet(ad.AnnData):
         full_lfcs = full_lfcs_value.copy()
         effective_nonzero = (counts != 0).any(axis=0)
         fit_mask = effective_nonzero & np.isfinite(dispersions)
+        if not refit_full:
+            fit_mask &= np.isfinite(full_lfcs.to_numpy(dtype=float)).all(axis=1)
         fit_idx = np.flatnonzero(fit_mask)
         fit_positions = fit_idx.tolist()
 
@@ -1341,25 +1358,36 @@ class DeseqDataSet(ad.AnnData):
                 full_lfcs,
             )
 
-        size_factors = self.obs["size_factors"].to_numpy(dtype=float)
+        size_factors = self._get_normalization_factors()
+        if size_factors.ndim == 2:
+            size_factors = size_factors[:, fit_idx]
         full_design = full_design_frame.to_numpy(dtype=float)
         reduced_values = reduced_design.to_numpy(dtype=float)
         fit_inference = inference or self.inference
 
-        full_beta, full_mu, _, full_fit_converged = fit_inference.irls(
-            counts=counts[:, fit_idx],
-            size_factors=normalization_factors,
-            design_matrix=full_design,
-            disp=dispersions[fit_idx],
-            min_mu=self.min_mu,
-            beta_tol=self.beta_tol,
-        )
-        full_lfcs.iloc[fit_idx] = full_beta
-        full_converged.iloc[fit_idx] = full_fit_converged
+        if refit_full:
+            full_beta, full_mu, _, full_fit_converged = fit_inference.irls(
+                counts=counts[:, fit_idx],
+                size_factors=size_factors,
+                design_matrix=full_design,
+                disp=dispersions[fit_idx],
+                min_mu=self.min_mu,
+                beta_tol=self.beta_tol,
+            )
+            full_lfcs.iloc[fit_idx] = full_beta
+            full_converged.iloc[fit_idx] = full_fit_converged
+        else:
+            full_mu = np.exp(
+                full_design @ full_lfcs.iloc[fit_idx].to_numpy(dtype=float).T
+            )
+            if size_factors.ndim == 1:
+                full_mu *= size_factors[:, None]
+            else:
+                full_mu *= size_factors
 
         _, reduced_mu, _, converged = fit_inference.irls(
             counts=counts[:, fit_idx],
-            size_factors=normalization_factors,
+            size_factors=size_factors,
             design_matrix=reduced_values,
             disp=dispersions[fit_idx],
             min_mu=self.min_mu,
@@ -1414,41 +1442,39 @@ class DeseqDataSet(ad.AnnData):
         if needs_full_recovery.any() and not refit_full:
             recovery_positions = np.flatnonzero(needs_full_recovery)
             recovery_idx = fit_idx[recovery_positions]
-            (
-                np.ones_like(full_deviance_scale),
-                full_deviance_scale,
-                reduced_deviance_scale,
+            recovery_size_factors = (
+                size_factors[:, recovery_positions]
+                if size_factors.ndim == 2
+                else size_factors
             )
-        )
-        machine_tolerance = 64 * np.finfo(float).eps * likelihood_scale
-        optimization_tolerance = machine_tolerance + abs(self.beta_tol) * (
-            full_deviance_scale + reduced_deviance_scale + 0.2
-        )
-        both_models_converged = full_status.fillna(False).to_numpy(
-            dtype=bool
-        ) & np.asarray(converged, dtype=bool)
-        allowed_negative = np.where(
-            both_models_converged,
-            optimization_tolerance,
-            machine_tolerance,
-        )
-        nonfinite_likelihood = (
-            ~np.isfinite(full_nll)
-            | ~np.isfinite(reduced_nll)
-            | ~np.isfinite(lrt_statistics)
-        )
-        materially_negative = ~nonfinite_likelihood & (
-            lrt_statistics < -allowed_negative
-        )
-        invalid_lrt = nonfinite_likelihood | materially_negative
-        lrt_statistics[(lrt_statistics < 0) & ~invalid_lrt] = 0.0
-        if nonfinite_likelihood.any():
-            warnings.warn(
-                f"{int(nonfinite_likelihood.sum())} gene(s) had non-finite "
-                "likelihoods after model fitting; their "
-                "statistics, p-values, and full-model deviances were set to NaN.",
-                RuntimeWarning,
-                stacklevel=2,
+            (
+                recovery_beta,
+                recovery_mu,
+                _,
+                recovery_converged,
+            ) = fit_inference.irls(
+                counts=counts[:, recovery_idx],
+                size_factors=recovery_size_factors,
+                design_matrix=full_design,
+                disp=dispersions[recovery_idx],
+                min_mu=self.min_mu,
+                beta_tol=self.beta_tol,
+            )
+            full_lfcs.iloc[recovery_idx] = recovery_beta
+            full_converged.iloc[recovery_idx] = recovery_converged
+            recovered_full_nll = np.atleast_1d(
+                np.asarray(
+                    nb_nll(
+                        counts[:, recovery_idx],
+                        recovery_mu,
+                        dispersions[recovery_idx],
+                    ),
+                    dtype=float,
+                )
+            )
+            full_nll[recovery_positions] = recovered_full_nll
+            lrt_statistics[recovery_positions] = 2 * (
+                reduced_nll[recovery_positions] - recovered_full_nll
             )
 
         full_status = full_converged.iloc[fit_idx]
@@ -1531,6 +1557,7 @@ class DeseqDataSet(ad.AnnData):
     def _store_lrt_results(
         self,
         reduced_design: pd.DataFrame,
+        reduced: str | pd.DataFrame,
         results: _LRTResult,
     ) -> None:
         """Store the default LRT result in serialization-safe AnnData slots."""
@@ -1543,13 +1570,6 @@ class DeseqDataSet(ad.AnnData):
             new_all_zero,
             full_lfcs,
         ) = results
-        var = cast(pd.DataFrame, self.var)
-        if (
-            "replaced" in var
-            and var["replaced"].any()
-            and _LRT_REPLACE_COUNTS_LAYER not in self.layers
-        ):
-            self.layers[_LRT_REPLACE_COUNTS_LAYER] = self._effective_counts()
         self.obsm["_lrt_reduced_design_matrix"] = pd.DataFrame(
             reduced_design.to_numpy(copy=True),
             index=self.obs_names.copy(),
@@ -1600,7 +1620,12 @@ class DeseqDataSet(ad.AnnData):
 
     def _lrt_cache_matches(self, reduced_design: pd.DataFrame) -> bool:
         """Return whether serialized LRT results match current fitted state."""
-        if not self._lrt_fit_state_matches():
+        if (
+            not self._lrt_fit_state_matches()
+            or "_lrt_reduced_design_matrix" not in self.obsm
+            or any(key not in self.var for key in _LRT_VAR_KEYS)
+            or _LRT_FULL_LFC_KEY not in self.varm
+        ):
             return False
 
         stored = self.obsm["_lrt_reduced_design_matrix"]
@@ -1900,11 +1925,12 @@ class DeseqDataSet(ad.AnnData):
 
         if test == "LRT":
             assert reduced_design is not None
+            assert reduced is not None
             if not self.quiet:
                 print("Running likelihood ratio tests...", file=sys.stderr)
             start = time.time()
             lrt_results = self._compute_lrt(reduced_design, inference=self.inference)
-            self._store_lrt_results(reduced_design, lrt_results)
+            self._store_lrt_results(reduced_design, reduced, lrt_results)
             if not self.quiet:
                 print(
                     f"... done in {time.time() - start:.2f} seconds.\n",
@@ -2715,8 +2741,7 @@ class DeseqDataSet(ad.AnnData):
 
     def _replace_outliers(self) -> None:
         """Replace values that are filtered out (based on Cooks) with imputed values."""
-        if _LRT_REPLACE_COUNTS_LAYER in self.layers:
-            del self.layers[_LRT_REPLACE_COUNTS_LAYER]
+        self._discard_owned_replace_counts()
 
         # Check that cooks distances are available. If not, compute them.
         if "cooks" not in self.layers:
@@ -2744,6 +2769,13 @@ class DeseqDataSet(ad.AnnData):
         self.var["replaced"] = idx.any(axis=0)
 
         if sum(self.var["replaced"] > 0):
+            if _REPLACE_COUNTS_LAYER in self.layers:
+                raise ValueError(
+                    "Cook replacement cannot create layers['replace_counts'] because "
+                    "that name is already used by a layer not owned by PyDESeq2. "
+                    "Rename or remove the existing layer before refitting outliers."
+                )
+
             # Compute replacement counts: trimmed means * normalization factors
             self.counts_to_refit = self[:, self.var["replaced"]].copy()
             if hasattr(self.counts_to_refit.X, "toarray"):
