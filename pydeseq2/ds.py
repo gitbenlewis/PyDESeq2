@@ -202,6 +202,8 @@ class DeseqStats:
         self.independent_filter = independent_filter
         self.base_mean = self.dds.var["_normed_means"].copy()
         self.prior_LFC_var = prior_LFC_var
+        lrt_fit_digest: str | None = None
+        lrt_cache_valid = False
 
         if self.test == "Wald":
             if reduced is not None:
@@ -214,12 +216,25 @@ class DeseqStats:
                     "prior_LFC_var, lfc_null, and alt_hypothesis are only supported "
                     "for Wald tests."
                 )
-            if "_lrt" in self.dds.uns and not self.dds._lrt_fit_state_matches():
+            try:
+                lrt_fit_digest = self.dds._lrt_fit_digest()
+            except (OverflowError, RuntimeError, TypeError, ValueError):
+                pass
+            if "_lrt" in self.dds.uns and (
+                lrt_fit_digest is None
+                or not self.dds._lrt_fit_state_matches(lrt_fit_digest)
+            ):
                 raise RuntimeError(
                     "Cached LRT fit state no longer matches this DeseqDataSet. "
                     "Rerun dds.deseq2(test='LRT', reduced=...) before creating "
                     "DeseqStats."
                 )
+            if lrt_fit_digest is None:
+                raise RuntimeError(
+                    "Could not fingerprint the fitted inputs required for this LRT. "
+                    "Rerun dds.deseq2() before creating DeseqStats."
+                )
+            lrt_cache_valid = "_lrt" in self.dds.uns
             self.reduced = reduced
             self.reduced_design_matrix = self.dds._prepare_lrt_reduced_design(reduced)
             self.lrt_df = int(
@@ -273,6 +288,30 @@ class DeseqStats:
         self._force_local_lrt_refit = (
             inference is not None and inference is not self.dds.inference
         )
+        self._lrt_has_run = False
+        self._lrt_unfiltered_p_values: pd.Series | None = None
+        self._lrt_fit_digest = lrt_fit_digest
+        self._lrt_cache_valid = lrt_cache_valid
+        self._lrt_fit_generation: int | None = None
+        self._lrt_input_sha256: str | None = None
+        if self.test == "LRT":
+            assert self.reduced_design_matrix is not None
+            assert lrt_fit_digest is not None
+            fit_generation = self.dds.uns.get("_fit_generation", 0)
+            if isinstance(fit_generation, (bool, np.bool_)) or not isinstance(
+                fit_generation, (int, np.integer)
+            ):
+                raise RuntimeError(
+                    "LRT fit generation is malformed. Rerun dds.deseq2() before "
+                    "creating DeseqStats."
+                )
+            self._lrt_fit_generation = int(fit_generation)
+            reduced_formula = self.reduced if isinstance(self.reduced, str) else ""
+            self._lrt_input_sha256 = self.dds._lrt_input_digest(
+                self.reduced_design_matrix,
+                reduced_formula,
+                lrt_fit_digest,
+            )
 
         if n_cpus is not None and (inference is not None or self.test == "LRT"):
             if hasattr(self.inference, "n_cpus"):
@@ -336,7 +375,10 @@ class DeseqStats:
                 "lfc_null and alt_hypothesis are only supported for Wald tests."
             )
 
-        if (
+        if self.test == "LRT":
+            rerun_summary = True
+            self.run_lrt_test()
+        elif (
             not hasattr(self, "p_values")
             or self.lfc_null != lfc_null
             or self.alt_hypothesis != alt_hypothesis
@@ -344,7 +386,7 @@ class DeseqStats:
             self.lfc_null = lfc_null
             self.alt_hypothesis = alt_hypothesis
             rerun_summary = True
-            self._run_selected_test()
+            self.run_wald_test()
 
         if self.cooks_filter:
             # Filter p-values based on Cooks outliers
@@ -369,16 +411,23 @@ class DeseqStats:
         self.results_df["padj"] = self.padj
 
         if not self.quiet:
-            if isinstance(self.contrast, np.ndarray):
-                # The contrast vector was directly provided
+            if self.test == "LRT":
+                if isinstance(self.contrast, np.ndarray):
+                    print(f"Reported log2 fold-change contrast vector: {self.contrast}")
+                else:
+                    print(
+                        "Reported log2 fold-change contrast: "
+                        f"{self.contrast[0]} {self.contrast[1]} vs {self.contrast[2]}"
+                    )
+                print("Likelihood-ratio test p-value: full model vs reduced model")
+            elif isinstance(self.contrast, np.ndarray):
                 print(
-                    f"Log2 fold change & {self.test} test p-value, contrast vector: "
+                    "Log2 fold change & Wald test p-value, contrast vector: "
                     f"{self.contrast}"
                 )
             else:
-                # The factor is categorical
                 print(
-                    f"Log2 fold change & {self.test} test p-value: "
+                    "Log2 fold change & Wald test p-value: "
                     f"{self.contrast[0]} {self.contrast[1]} vs {self.contrast[2]}"
                 )
             print(self.results_df)
@@ -456,14 +505,43 @@ class DeseqStats:
         """Perform the selected full-versus-reduced likelihood-ratio test."""
         if self.test != "LRT" or self.reduced_design_matrix is None:
             raise ValueError("run_lrt_test() requires test='LRT' and a reduced model.")
-        if getattr(self, "_lrt_has_run", False):
+        fit_generation = self.dds.uns.get("_fit_generation", 0)
+        reduced_formula = self.reduced if isinstance(self.reduced, str) else ""
+        try:
+            input_sha256 = self.dds._lrt_input_digest(
+                self.reduced_design_matrix,
+                reduced_formula,
+                self._lrt_fit_digest,
+            )
+        except (OverflowError, RuntimeError, TypeError, ValueError):
+            input_sha256 = None
+        if (
+            isinstance(fit_generation, (bool, np.bool_))
+            or not isinstance(fit_generation, (int, np.integer))
+            or int(fit_generation) != self._lrt_fit_generation
+            or input_sha256 is None
+            or input_sha256 != self._lrt_input_sha256
+        ):
+            raise RuntimeError(
+                "LRT inputs changed after DeseqStats construction. Rerun "
+                "dds.deseq2() and create a new DeseqStats before testing."
+            )
+        if self._lrt_has_run:
+            assert self._lrt_unfiltered_p_values is not None
+            self.p_values = self._lrt_unfiltered_p_values.copy()
+            for attribute in ("padj", "results_df"):
+                if hasattr(self, attribute):
+                    delattr(self, attribute)
             return
 
-        use_dds_cache = not self._force_local_lrt_refit and self.dds._lrt_cache_matches(
+        cached_results = None
+        if not self._force_local_lrt_refit and self._lrt_cache_valid:
+            cached_results = self.dds._load_lrt_results()
+
+        if cached_results is not None and self.dds._lrt_cache_matches(
             self.reduced_design_matrix
-        )
-        if use_dds_cache:
-            results = self.dds._load_lrt_results()
+        ):
+            results = cached_results
         else:
             if not self.quiet:
                 print("Running likelihood ratio tests...", file=sys.stderr)
@@ -472,7 +550,24 @@ class DeseqStats:
                 self.reduced_design_matrix,
                 inference=self.inference,
                 refit_full=self._force_local_lrt_refit,
+                full_lfcs_seed=None if cached_results is None else cached_results[6],
+                full_converged_seed=(
+                    None if cached_results is None else cached_results[4]
+                ),
             )
+            if not self._force_local_lrt_refit:
+                reduced = (
+                    self.reduced
+                    if self.reduced is not None
+                    else self.reduced_design_matrix
+                )
+                self.dds._store_lrt_results(
+                    self.reduced_design_matrix,
+                    reduced,
+                    results,
+                    self._lrt_fit_digest,
+                )
+                self._lrt_cache_valid = True
             if not self.quiet:
                 print(
                     f"... done in {time.time() - start:.2f} seconds.\n",
@@ -490,6 +585,7 @@ class DeseqStats:
         ) = results
         self.statistics = statistics.copy()
         self.p_values = p_values.copy()
+        self._lrt_unfiltered_p_values = self.p_values.copy()
         self.full_deviance = full_deviance.copy()
         self.reduced_converged = reduced_converged.copy()
         self.full_converged = full_converged.copy()
@@ -526,11 +622,20 @@ class DeseqStats:
 
         design_matrix = self.design_matrix.values
         size = 1.0 / self.dds.var["dispersions"].values
-        effective_counts = self.dds._effective_counts()
-        effective_nonzero = (effective_counts != 0).any(axis=0)
-        shrink_mask = self.dds.var["non_zero"].to_numpy(dtype=bool) & effective_nonzero
-        shrink_idx = np.flatnonzero(shrink_mask)
-        shrink_genes = self.dds.var_names[shrink_idx]
+        if self.test == "LRT":
+            effective_counts = self.dds._effective_counts()
+            effective_nonzero = self.dds._nonzero_count_columns(effective_counts)
+            shrink_mask = (
+                self.dds.var["non_zero"].to_numpy(dtype=bool) & effective_nonzero
+            )
+            shrink_idx = np.flatnonzero(shrink_mask)
+            shrink_counts = effective_counts[:, shrink_idx]
+            shrink_genes = self.dds.var_names[shrink_idx]
+        else:
+            shrink_mask = None
+            shrink_idx = self.dds.non_zero_idx
+            shrink_counts = self.dds.X[:, shrink_idx]
+            shrink_genes = self.dds.non_zero_genes
         offset = np.log(self.dds._get_normalization_factors(shrink_idx))
 
         # Set priors
@@ -545,7 +650,7 @@ class DeseqStats:
         start = time.time()
         lfcs, inv_hessians, l_bfgs_b_converged_ = self.inference.lfc_shrink_nbinom_glm(
             design_matrix=design_matrix,
-            counts=effective_counts[:, shrink_idx],
+            counts=shrink_counts,
             size=size[shrink_idx],
             offset=offset,
             prior_no_shrink_scale=prior_no_shrink_scale,
@@ -593,7 +698,13 @@ class DeseqStats:
             self.results_df["log2FoldChange"] = self.LFC.iloc[:, coeff_idx] / np.log(2)
             self.results_df["lfcSE"] = self.SE / np.log(2)
             if not self.quiet:
-                print(f"Shrunk log2 fold change & {self.test} test p-value: {coeff}")
+                if self.test == "LRT":
+                    print(
+                        f"Shrunk log2 fold change: {coeff}; likelihood-ratio test "
+                        "p-value remains the full-vs-reduced omnibus comparison"
+                    )
+                else:
+                    print(f"Shrunk log2 fold change & Wald test p-value: {coeff}")
                 print(self.results_df)
 
     def plot_MA(self, log: bool = True, save_path: str | None = None, **kwargs):

@@ -62,7 +62,8 @@ jobs:
             --with 'pytest==8.4.0' \
             python -m pytest -q \
             tests/test_transcript_length_normalization.py \
-            tests/test_utils.py
+            tests/test_utils.py \
+            'tests/test_lrt.py::test_sparse_lrt_matches_dense_with_transcript_normalization[csc_array]'
       - name: Test with pytest
         run: |
           uv run coverage run -m pytest

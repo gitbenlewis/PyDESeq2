@@ -91,10 +91,10 @@ run_lrt <- function(
         ),
         filename
     )
-    dds
+    invisible(dds)
 }
 
-single_factor_dds <- run_lrt(
+run_lrt(
     count_data,
     col_data,
     full = ~condition,
@@ -104,7 +104,7 @@ single_factor_dds <- run_lrt(
     seed = 1001L
 )
 
-multi_factor_dds <- run_lrt(
+run_lrt(
     count_data,
     col_data,
     full = ~group + condition,
@@ -119,7 +119,7 @@ multilevel_data$condition3 <- factor(
     rep(c("A", "B", "C"), length.out = nrow(multilevel_data)),
     levels = c("A", "B", "C")
 )
-multilevel_dds <- run_lrt(
+run_lrt(
     count_data,
     multilevel_data,
     full = ~condition3,
@@ -153,33 +153,6 @@ if (is.null(replaced_genes) || !isTRUE(replaced_genes[[gene1_index]])) {
 write.csv(
     assay(outlier_dds, "replaceCounts"),
     file.path(output_dir, "r_lrt_outlier_replace_counts.csv"),
-    quote = FALSE
-)
-
-manifest <- data.frame(
-    fixture = c(
-        "r_lrt_single_factor.csv",
-        "r_lrt_multi_factor.csv",
-        "r_lrt_multilevel.csv",
-        "r_lrt_outlier.csv"
-    ),
-    full = c("~ condition", "~ group + condition", "~ condition3", "~ condition"),
-    reduced = c("~ 1", "~ group", "~ 1", "~ 1"),
-    contrast = c(
-        "condition: B vs A",
-        "condition: B vs A",
-        "condition3: B vs A",
-        "condition: B vs A"
-    ),
-    lrt_df = c(1L, 1L, 2L, 1L),
-    seed = 1001:1004,
-    outlier_count = c(NA_integer_, NA_integer_, NA_integer_, 200L),
-    stringsAsFactors = FALSE
-)
-write.csv(
-    manifest,
-    file.path(output_dir, "r_lrt_manifest.csv"),
-    row.names = FALSE,
     quote = FALSE
 )
 

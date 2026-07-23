@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 from formulaic_contrasts import FormulaicContrasts  # type: ignore[import-untyped]
 from scipy.optimize import minimize
+from scipy.sparse import csr_matrix  # type: ignore
 from scipy.sparse import issparse  # type: ignore
 from scipy.special import polygamma  # type: ignore
 from scipy.stats import chi2  # type: ignore
@@ -62,8 +63,9 @@ _LRT_VAR_KEYS = (
 )
 
 _LRT_FULL_LFC_KEY = "_lrt_full_LFC"
-_LRT_CACHE_VERSION = 1
-_REPLACE_COUNTS_LAYER = "replace_counts"
+_LRT_CACHE_VERSION = 4
+_LRT_GENE_BLOCK_SIZE = 128
+_REPLACE_COUNTS_LAYER = "_pydeseq2_cook_replacement_delta"
 _REPLACE_COUNTS_OWNER_KEY = "_pydeseq2_replace_counts_owned"
 
 _LRTResult = tuple[
@@ -532,6 +534,7 @@ class DeseqDataSet(ad.AnnData):
             )
 
         if adata is not None and has_transcript_lengths and not preserve_inherited_fit:
+            self._invalidate_lrt_cache(discard_replace_counts=True)
             # Invalidate fitting state derived from copied normalization factors.
             for column in ("size_factors", "replaceable"):
                 if column in self.obs:
@@ -607,8 +610,9 @@ class DeseqDataSet(ad.AnnData):
         self.inference = inference or DefaultInference(n_cpus=n_cpus)
 
         if preserve_inherited_fit and adata is not None:
-            if "LFC" in self.varm:
-                self.varm["LFC"] = self.varm["LFC"].copy()
+            for key in ("LFC", _LRT_FULL_LFC_KEY):
+                if key in self.varm:
+                    self.varm[key] = self.varm[key].copy()
 
             self._normalization_fit_type = adata._normalization_fit_type
             self._normalization_control_mask = adata._normalization_control_mask.copy()
@@ -726,14 +730,9 @@ class DeseqDataSet(ad.AnnData):
                 )
             reduced_matrix = self.obsm["_lrt_reduced_design_matrix"]
             if not isinstance(reduced_matrix, pd.DataFrame):
-                metadata = self.uns.get("_lrt", {})
-                columns = metadata.get("reduced_design_columns", None)
-                if hasattr(reduced_matrix, "toarray"):
-                    reduced_matrix = reduced_matrix.toarray()
-                reduced_matrix = pd.DataFrame(
-                    np.asarray(reduced_matrix),
-                    index=self.obs_names,
-                    columns=columns,
+                raise RuntimeError(
+                    "Cached LRT reduced design is not DataFrame-backed. "
+                    "Rerun dds.deseq2(test='LRT', reduced=...)."
                 )
         elif isinstance(self.design, str):
             if not isinstance(reduced, str):
@@ -748,19 +747,6 @@ class DeseqDataSet(ad.AnnData):
                     f"Could not build the reduced design from {reduced!r}: {error}"
                 ) from error
 
-            try:
-                reduced_variables = set(reduced_contrasts.variables)
-            except KeyError:
-                reduced_variables = set()
-            full_variables = set(self.variables)
-            extra_variables = sorted(
-                str(variable) for variable in reduced_variables - full_variables
-            )
-            if extra_variables:
-                raise ValueError(
-                    "The reduced design contains variables not present in the full "
-                    f"design: {', '.join(extra_variables)}."
-                )
             reduced_matrix = reduced_contrasts.design_matrix
         else:
             if not isinstance(reduced, pd.DataFrame):
@@ -798,7 +784,8 @@ class DeseqDataSet(ad.AnnData):
             raise ValueError("The reduced design matrix is not full column rank.")
 
         full_values = np.asarray(self.obsm["design_matrix"], dtype=float)
-        if np.linalg.matrix_rank(full_values) < full_values.shape[1]:
+        full_rank = np.linalg.matrix_rank(full_values)
+        if full_rank < full_values.shape[1]:
             raise ValueError("The full design matrix is not full column rank.")
         if full_values.shape[1] <= reduced_values.shape[1]:
             raise ValueError(
@@ -809,7 +796,7 @@ class DeseqDataSet(ad.AnnData):
         augmented_rank = np.linalg.matrix_rank(
             np.column_stack((full_values, reduced_values))
         )
-        if augmented_rank != np.linalg.matrix_rank(full_values):
+        if augmented_rank != full_rank:
             raise ValueError("The reduced model is not nested within the full model.")
 
         return pd.DataFrame(
@@ -852,23 +839,22 @@ class DeseqDataSet(ad.AnnData):
                 delattr(self, attribute)
 
     @staticmethod
-    def _validated_lrt_counts(values: object) -> np.ndarray:
-        """Return canonical int64 counts after strict LRT input validation."""
-        counts = np.asarray(values)
-        error = (
-            "Effective counts must be finite, non-negative integers within the "
-            "int64 range."
-        )
-        if counts.dtype.kind not in {"b", "i", "u", "f"}:
-            raise ValueError(error)
-        if not np.isfinite(counts).all() or (counts < 0).any():
-            raise ValueError(error)
-        if counts.dtype.kind == "f":
-            if (counts != np.floor(counts)).any() or (counts >= float(2**63)).any():
-                raise ValueError(error)
-        elif (counts > np.iinfo(np.int64).max).any():
-            raise ValueError(error)
-        return np.ascontiguousarray(counts, dtype="<i8")
+    def _nonzero_count_columns(counts: Any) -> np.ndarray:
+        """Return a dense mask identifying columns with at least one nonzero count."""
+        if issparse(counts):
+            return np.asarray((cast(Any, counts) != 0).sum(axis=0)).ravel() > 0
+        return np.asarray((np.asarray(counts) != 0).any(axis=0), dtype=bool)
+
+    @staticmethod
+    def _lrt_nb_nll(
+        counts: Any,
+        mu: np.ndarray,
+        dispersions: np.ndarray,
+    ) -> np.ndarray:
+        """Evaluate likelihoods for one already-bounded LRT gene block."""
+        if issparse(counts):
+            counts = cast(Any, counts).toarray()
+        return np.atleast_1d(np.asarray(nb_nll(counts, mu, dispersions), dtype=float))
 
     @staticmethod
     def _validated_lrt_bool_values(values: object) -> np.ndarray:
@@ -882,25 +868,16 @@ class DeseqDataSet(ad.AnnData):
         return np.ascontiguousarray(array, dtype="<i1")
 
     @staticmethod
-    def _coerce_lrt_fit_generation(value: object) -> int | None:
-        """Return a serialization-safe LRT fit generation, or ``None``."""
-        if isinstance(value, (bool, np.bool_)) or not isinstance(
-            value, (int, np.integer)
-        ):
-            return None
-        generation = int(value)
-        if generation < 0 or generation > np.iinfo(np.int64).max:
-            return None
-        return generation
-
-    @staticmethod
     def _update_lrt_array_digest(
         digest: _LRTDigest,
         label: str,
         values: object,
         kind: Literal["float", "int", "bool"],
     ) -> None:
-        """Stream one canonical labeled LRT array into a digest."""
+        """Stream one canonical labeled LRT array into a digest.
+
+        Integer inputs must already be canonical int64 arrays.
+        """
         if kind == "float":
             array = np.asarray(values, dtype="<f8")
             array = np.ascontiguousarray(array)
@@ -908,7 +885,11 @@ class DeseqDataSet(ad.AnnData):
                 array = array.copy()
                 array[np.isnan(array)] = np.nan
         elif kind == "int":
-            array = DeseqDataSet._validated_lrt_counts(values)
+            array = (
+                cast(Any, values)
+                if issparse(values)
+                else np.ascontiguousarray(values, dtype="<i8")
+            )
         else:
             array = DeseqDataSet._validated_lrt_bool_values(values)
 
@@ -918,7 +899,19 @@ class DeseqDataSet(ad.AnnData):
         digest.update(encoded_label)
         digest.update(len(shape).to_bytes(8, "little"))
         digest.update(shape)
-        digest.update(array.data.cast("B"))
+        if issparse(array):
+            sparse_array = cast(Any, array).tocsr(copy=False)
+            digest.update(b"sparse_csr")
+            for buffer in (
+                np.asarray(sparse_array.indptr, dtype="<i8"),
+                np.asarray(sparse_array.indices, dtype="<i8"),
+                np.asarray(sparse_array.data, dtype="<i8"),
+            ):
+                buffer = np.ascontiguousarray(buffer)
+                digest.update(buffer.nbytes.to_bytes(8, "little"))
+                digest.update(buffer.data.cast("B"))
+        else:
+            digest.update(array.data.cast("B"))
 
     @staticmethod
     def _update_lrt_text_digest(
@@ -944,10 +937,8 @@ class DeseqDataSet(ad.AnnData):
             na_value=-1,
         )
 
-    def _lrt_input_digest(
-        self, reduced_design: pd.DataFrame, reduced_formula: str
-    ) -> str | None:
-        """Fingerprint every scientific input used by a prepared LRT."""
+    def _lrt_fit_digest(self) -> str | None:
+        """Fingerprint the fitted scientific state shared by every LRT."""
         full_design = self.obsm.get("design_matrix")
         full_lfcs = self.varm.get("LFC")
         if not isinstance(full_design, pd.DataFrame) or not isinstance(
@@ -960,16 +951,14 @@ class DeseqDataSet(ad.AnnData):
             return None
         if not pd.Index(full_design.index).equals(pd.Index(self.obs_names)):
             return None
-        if not pd.Index(reduced_design.index).equals(pd.Index(self.obs_names)):
-            return None
         if not pd.Index(full_lfcs.index).equals(pd.Index(self.var_names)):
             return None
         if [str(column) for column in full_lfcs.columns] != [
             str(column) for column in full_design.columns
         ]:
             return None
-
         digest = hashlib.sha256()
+        replacement_owned = self._owns_replace_counts()
         self._update_lrt_array_digest(
             digest, "effective_counts", self._effective_counts(), "int"
         )
@@ -993,18 +982,12 @@ class DeseqDataSet(ad.AnnData):
         )
         self._update_lrt_array_digest(
             digest,
-            "reduced_design",
-            reduced_design.to_numpy(dtype=float),
-            "float",
-        )
-        self._update_lrt_array_digest(
-            digest,
             "non_zero",
             self.var["non_zero"].to_numpy(),
             "bool",
         )
         self._update_lrt_array_digest(
-            digest, "replacement_owned", [self._owns_replace_counts()], "bool"
+            digest, "replacement_owned", [replacement_owned], "bool"
         )
         self._update_lrt_array_digest(
             digest, "lrt_controls", [self.min_mu, self.beta_tol], "float"
@@ -1021,13 +1004,13 @@ class DeseqDataSet(ad.AnnData):
         )
         self._update_lrt_text_digest(
             digest,
-            "reduced_design_columns",
-            [str(column) for column in reduced_design.columns],
+            "obs_names",
+            [str(name) for name in self.obs_names],
         )
         self._update_lrt_text_digest(
             digest,
-            "reduced_formula",
-            [reduced_formula],
+            "var_names",
+            [str(name) for name in self.var_names],
         )
 
         if "replaced" in self.var:
@@ -1053,68 +1036,41 @@ class DeseqDataSet(ad.AnnData):
             self._update_lrt_array_digest(digest, "has_lfc_converged", [False], "bool")
         return digest.hexdigest()
 
-    def _lrt_output_digest(self) -> str | None:
-        """Fingerprint every serialized output returned by a prepared LRT."""
-        if any(key not in self.var for key in _LRT_VAR_KEYS):
+    def _lrt_input_digest(
+        self,
+        reduced_design: pd.DataFrame,
+        reduced_formula: str,
+        fit_digest: str | None = None,
+    ) -> str | None:
+        """Fingerprint a reduced model together with the current fitted state."""
+        if not pd.Index(reduced_design.index).equals(pd.Index(self.obs_names)):
             return None
-        full_lfcs = self.varm.get(_LRT_FULL_LFC_KEY)
-        full_design = self.obsm.get("design_matrix")
-        if not isinstance(full_lfcs, pd.DataFrame) or not isinstance(
-            full_design, pd.DataFrame
-        ):
-            return None
-        if not pd.Index(full_lfcs.index).equals(pd.Index(self.var_names)):
-            return None
-        if [str(column) for column in full_lfcs.columns] != [
-            str(column) for column in full_design.columns
-        ]:
+        if fit_digest is None:
+            fit_digest = self._lrt_fit_digest()
+        if fit_digest is None:
             return None
 
         digest = hashlib.sha256()
-        self._update_lrt_array_digest(
-            digest, "statistics", self.var["_lrt_statistic"].to_numpy(), "float"
-        )
-        self._update_lrt_array_digest(
-            digest, "p_values", self.var["_lrt_pvalue"].to_numpy(), "float"
-        )
+        self._update_lrt_text_digest(digest, "fit_sha256", [fit_digest])
         self._update_lrt_array_digest(
             digest,
-            "full_deviance",
-            self.var["_lrt_full_deviance"].to_numpy(),
-            "float",
-        )
-        self._update_lrt_array_digest(
-            digest,
-            "reduced_converged",
-            self._lrt_nullable_bool_values(self.var["_lrt_reduced_converged"]),
-            "bool",
-        )
-        self._update_lrt_array_digest(
-            digest,
-            "full_converged",
-            self._lrt_nullable_bool_values(self.var["_lrt_full_converged"]),
-            "bool",
-        )
-        self._update_lrt_array_digest(
-            digest,
-            "new_all_zero",
-            self.var["_lrt_new_all_zero"].to_numpy(),
-            "bool",
-        )
-        self._update_lrt_array_digest(
-            digest,
-            "cached_full_lfcs",
-            full_lfcs.to_numpy(dtype=float),
+            "reduced_design",
+            reduced_design.to_numpy(dtype=float),
             "float",
         )
         self._update_lrt_text_digest(
             digest,
-            "cached_full_lfc_columns",
-            [str(column) for column in full_lfcs.columns],
+            "reduced_design_columns",
+            [str(column) for column in reduced_design.columns],
+        )
+        self._update_lrt_text_digest(
+            digest,
+            "reduced_formula",
+            [reduced_formula],
         )
         return digest.hexdigest()
 
-    def _lrt_fit_state_matches(self) -> bool:
+    def _lrt_fit_state_matches(self, fit_digest: str | None = None) -> bool:
         """Return whether cached LRT provenance matches the current fitted state."""
         try:
             metadata_value = self.uns["_lrt"]
@@ -1131,6 +1087,15 @@ class DeseqDataSet(ad.AnnData):
                 return False
             if not pd.Index(reduced_design.index).equals(pd.Index(self.obs_names)):
                 return False
+            cached_lfcs = self.varm.get(_LRT_FULL_LFC_KEY)
+            if (
+                any(key not in self.var for key in _LRT_VAR_KEYS)
+                or not isinstance(cached_lfcs, pd.DataFrame)
+                or not pd.Index(cached_lfcs.index).equals(pd.Index(self.var_names))
+                or [str(column) for column in cached_lfcs.columns]
+                != [str(column) for column in full_design.columns]
+            ):
+                return False
 
             stored_cache_version = metadata.get("cache_version")
             if (
@@ -1140,17 +1105,13 @@ class DeseqDataSet(ad.AnnData):
             ):
                 return False
 
-            stored_generation = self._coerce_lrt_fit_generation(
-                metadata.get("fit_generation")
-            )
-            current_generation = self._coerce_lrt_fit_generation(
-                self.uns.get("_fit_generation", 0)
-            )
-            if (
-                stored_generation is None
-                or current_generation is None
-                or stored_generation != current_generation
-            ):
+            stored_generation = metadata.get("fit_generation")
+            current_generation = self.uns.get("_fit_generation", 0)
+            if any(
+                isinstance(value, (bool, np.bool_))
+                or not isinstance(value, (int, np.integer))
+                for value in (stored_generation, current_generation)
+            ) or int(cast(Any, stored_generation)) != int(cast(Any, current_generation)):
                 return False
 
             stored_df = metadata.get("df")
@@ -1163,70 +1124,34 @@ class DeseqDataSet(ad.AnnData):
             reduced_formula = metadata.get("reduced_formula")
             if not isinstance(reduced_formula, str):
                 return False
-            if list(
-                np.atleast_1d(
-                    np.asarray(metadata.get("reduced_design_columns", []), dtype=str)
-                )
-            ) != [str(column) for column in reduced_design.columns]:
-                return False
-            if list(
-                np.atleast_1d(np.asarray(metadata.get("var_names", []), dtype=str))
-            ) != [str(name) for name in self.var_names]:
-                return False
-            if list(
-                np.atleast_1d(np.asarray(metadata.get("obs_names", []), dtype=str))
-            ) != [str(name) for name in self.obs_names]:
-                return False
-            if list(
-                np.atleast_1d(
-                    np.asarray(metadata.get("full_design_columns", []), dtype=str)
-                )
-            ) != [str(column) for column in full_design.columns]:
-                return False
 
-            stored_values = np.asarray(
-                metadata.get("full_design_values", []), dtype=float
+            input_digest = self._lrt_input_digest(
+                reduced_design,
+                reduced_formula,
+                fit_digest,
             )
-            current_values = np.asarray(full_design, dtype=float)
-            if stored_values.shape != current_values.shape or not np.array_equal(
-                stored_values,
-                current_values,
-                equal_nan=True,
-            ):
-                return False
-
-            input_digest = self._lrt_input_digest(reduced_design, reduced_formula)
-            output_digest = self._lrt_output_digest()
             return (
-                input_digest is not None
-                and output_digest is not None
-                and str(metadata.get("input_sha256", "")) == input_digest
-                and str(metadata.get("output_sha256", "")) == output_digest
+                input_digest is not None and metadata.get("input_sha256") == input_digest
             )
-        except (AttributeError, KeyError, OverflowError, TypeError, ValueError):
+        except (
+            AttributeError,
+            KeyError,
+            OverflowError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ):
             return False
 
     def _invalidate_lrt_cache(self, *, discard_replace_counts: bool = False) -> None:
         """Remove cached test results after changing fitted model state."""
         var = cast(pd.DataFrame, self.var)
-        has_cached_state = (
-            "_deseq2_test" in self.uns
-            or "_lrt" in self.uns
-            or "_lrt_reduced_design_matrix" in self.obsm
-            or any(key in var for key in _LRT_VAR_KEYS)
-            or _LRT_FULL_LFC_KEY in self.varm
-        )
-        fit_generation = self._coerce_lrt_fit_generation(
-            self.uns.get("_fit_generation", 0)
-        )
-        if fit_generation is None:
+        fit_generation = self.uns.get("_fit_generation", 0)
+        if isinstance(fit_generation, (bool, np.bool_)) or not isinstance(
+            fit_generation, (int, np.integer)
+        ):
             fit_generation = 0
-        if has_cached_state:
-            if fit_generation == np.iinfo(np.int64).max:
-                fit_generation = 0
-            else:
-                fit_generation += 1
-        self.uns["_fit_generation"] = np.int64(fit_generation)
+        self.uns["_fit_generation"] = int(fit_generation) + 1
 
         if "_deseq2_test" in self.uns:
             del self.uns["_deseq2_test"]
@@ -1243,16 +1168,28 @@ class DeseqDataSet(ad.AnnData):
         if discard_replace_counts:
             self._discard_owned_replace_counts()
 
-    def _effective_counts(self) -> np.ndarray:
+    def _effective_counts(self) -> Any:
         """Return the counts used for final inference, including Cook replacements."""
+        if self.X is None:
+            raise RuntimeError("A count matrix is required.")
         counts = self.X
-        if self._owns_replace_counts():
-            counts = self.layers[_REPLACE_COUNTS_LAYER]
-        if counts is None:
-            raise RuntimeError("LRT requires a count matrix.")
-        if hasattr(counts, "toarray"):
-            counts = counts.toarray()
-        return self._validated_lrt_counts(counts)
+        if not self._owns_replace_counts():
+            return counts
+
+        replacement_delta = self.layers[_REPLACE_COUNTS_LAYER]
+        if not issparse(replacement_delta):
+            raise RuntimeError("Internally managed Cook replacement state is malformed.")
+        replacement_delta = cast(Any, replacement_delta).tocsr(copy=False)
+        if replacement_delta.shape != counts.shape:
+            raise RuntimeError("Internally managed Cook replacement state is malformed.")
+
+        if issparse(counts):
+            effective_counts = counts + replacement_delta
+        else:
+            effective_counts = counts.copy()
+            delta = replacement_delta.tocoo(copy=False)
+            np.add.at(effective_counts, (delta.row, delta.col), delta.data)
+        return effective_counts
 
     def _compute_lrt(
         self,
@@ -1260,15 +1197,9 @@ class DeseqDataSet(ad.AnnData):
         inference: Inference | None = None,
         *,
         refit_full: bool = False,
-    ) -> tuple[
-        pd.Series,
-        pd.Series,
-        pd.Series,
-        pd.Series,
-        pd.Series,
-        pd.Series,
-        pd.DataFrame,
-    ]:
+        full_lfcs_seed: pd.DataFrame | None = None,
+        full_converged_seed: pd.Series | None = None,
+    ) -> _LRTResult:
         """Fit a reduced NB GLM and compute a classical unpenalized LRT."""
         if "LFC" not in self.varm or "dispersions" not in self.var:
             raise RuntimeError(
@@ -1296,11 +1227,11 @@ class DeseqDataSet(ad.AnnData):
 
         counts = self._effective_counts()
         dispersions = var["dispersions"].to_numpy(dtype=float)
-        full_lfcs = full_lfcs_value.copy()
-        effective_nonzero = (counts != 0).any(axis=0)
+        full_lfcs = (
+            full_lfcs_value if full_lfcs_seed is None else full_lfcs_seed
+        ).copy()
+        effective_nonzero = self._nonzero_count_columns(counts)
         fit_mask = effective_nonzero & np.isfinite(dispersions)
-        if not refit_full:
-            fit_mask &= np.isfinite(full_lfcs.to_numpy(dtype=float)).all(axis=1)
         fit_idx = np.flatnonzero(fit_mask)
         fit_positions = fit_idx.tolist()
 
@@ -1324,12 +1255,19 @@ class DeseqDataSet(ad.AnnData):
             pd.array([pd.NA] * self.n_vars, dtype="boolean"),
             index=self.var_names,
         )
-        if not refit_full and "_LFC_converged" in var:
+        if refit_full:
             full_converged = pd.Series(
-                pd.array(
-                    var["_LFC_converged"].to_numpy(),
-                    dtype="boolean",
-                ),
+                pd.array([pd.NA] * self.n_vars, dtype="boolean"),
+                index=self.var_names,
+            )
+        elif full_converged_seed is not None:
+            full_converged = pd.Series(
+                pd.array(full_converged_seed.to_numpy(), dtype="boolean"),
+                index=self.var_names,
+            )
+        elif "_LFC_converged" in var:
+            full_converged = pd.Series(
+                pd.array(var["_LFC_converged"].to_numpy(), dtype="boolean"),
                 index=self.var_names,
             )
         else:
@@ -1358,63 +1296,77 @@ class DeseqDataSet(ad.AnnData):
                 full_lfcs,
             )
 
-        size_factors = self._get_normalization_factors()
-        if size_factors.ndim == 2:
-            size_factors = size_factors[:, fit_idx]
         full_design = full_design_frame.to_numpy(dtype=float)
         reduced_values = reduced_design.to_numpy(dtype=float)
         fit_inference = inference or self.inference
+        block_size = (
+            _LRT_GENE_BLOCK_SIZE if self.low_memory or issparse(counts) else len(fit_idx)
+        )
+        full_nll = np.empty(len(fit_idx), dtype=float)
+        reduced_nll = np.empty(len(fit_idx), dtype=float)
+        converged = np.empty(len(fit_idx), dtype=bool)
 
-        if refit_full:
-            full_beta, full_mu, _, full_fit_converged = fit_inference.irls(
-                counts=counts[:, fit_idx],
-                size_factors=size_factors,
-                design_matrix=full_design,
-                disp=dispersions[fit_idx],
+        for start in range(0, len(fit_idx), block_size):
+            stop = min(start + block_size, len(fit_idx))
+            fit_slice = slice(start, stop)
+            gene_idx = fit_idx[fit_slice]
+            block_counts = counts[:, gene_idx]
+            block_factors = self._get_normalization_factors(gene_idx)
+            block_dispersions = dispersions[gene_idx]
+
+            if refit_full:
+                full_beta, full_mu, _, block_full_converged = fit_inference.irls(
+                    counts=block_counts,
+                    size_factors=block_factors,
+                    design_matrix=full_design,
+                    disp=block_dispersions,
+                    min_mu=self.min_mu,
+                    beta_tol=self.beta_tol,
+                )
+                full_lfcs.iloc[gene_idx] = full_beta
+                full_converged.iloc[gene_idx] = list(
+                    np.asarray(block_full_converged, dtype=bool)
+                )
+            else:
+                full_mu = np.exp(
+                    full_design @ full_lfcs.iloc[gene_idx].to_numpy(dtype=float).T
+                )
+                if block_factors.ndim == 1:
+                    full_mu *= block_factors[:, None]
+                else:
+                    full_mu *= block_factors
+
+            _, reduced_mu, _, block_converged = fit_inference.irls(
+                counts=block_counts,
+                size_factors=block_factors,
+                design_matrix=reduced_values,
+                disp=block_dispersions,
                 min_mu=self.min_mu,
                 beta_tol=self.beta_tol,
             )
-            full_lfcs.iloc[fit_idx] = full_beta
-            full_converged.iloc[fit_idx] = full_fit_converged
-        else:
-            full_mu = np.exp(
-                full_design @ full_lfcs.iloc[fit_idx].to_numpy(dtype=float).T
+            converged[fit_slice] = np.asarray(block_converged, dtype=bool)
+            full_nll[fit_slice] = self._lrt_nb_nll(
+                block_counts,
+                full_mu,
+                block_dispersions,
             )
-            if size_factors.ndim == 1:
-                full_mu *= size_factors[:, None]
-            else:
-                full_mu *= size_factors
+            reduced_nll[fit_slice] = self._lrt_nb_nll(
+                block_counts,
+                reduced_mu,
+                block_dispersions,
+            )
+            del full_mu, reduced_mu, _
 
-        _, reduced_mu, _, converged = fit_inference.irls(
-            counts=counts[:, fit_idx],
-            size_factors=size_factors,
-            design_matrix=reduced_values,
-            disp=dispersions[fit_idx],
-            min_mu=self.min_mu,
-            beta_tol=self.beta_tol,
-        )
-        reduced_failed = ~np.asarray(converged, dtype=bool)
+        reduced_failed = ~converged
         if reduced_failed.any():
             warnings.warn(
                 "The reduced-model fit did not converge for "
                 f"{int(reduced_failed.sum())} gene(s); inspect "
-                "'_lrt_reduced_converged' before interpreting those results.",
+                "DeseqStats.reduced_converged before interpreting those results.",
                 UserWarning,
                 stacklevel=2,
             )
 
-        full_nll = np.atleast_1d(
-            np.asarray(
-                nb_nll(counts[:, fit_idx], full_mu, dispersions[fit_idx]),
-                dtype=float,
-            )
-        )
-        reduced_nll = np.atleast_1d(
-            np.asarray(
-                nb_nll(counts[:, fit_idx], reduced_mu, dispersions[fit_idx]),
-                dtype=float,
-            )
-        )
         lrt_statistics = 2 * (reduced_nll - full_nll)
 
         def negative_tolerances() -> tuple[np.ndarray, np.ndarray]:
@@ -1433,49 +1385,51 @@ class DeseqDataSet(ad.AnnData):
             )
             return machine_tolerance, optimization_tolerance
 
-        machine_tolerance, _ = negative_tolerances()
-        needs_full_recovery = (
-            ~np.isfinite(full_nll)
-            | np.isneginf(lrt_statistics)
-            | (np.isfinite(lrt_statistics) & (lrt_statistics < -machine_tolerance))
+        machine_tolerance, optimization_tolerance = negative_tolerances()
+        full_status = full_converged.iloc[fit_idx]
+        both_models_converged = full_status.fillna(False).to_numpy(
+            dtype=bool
+        ) & np.asarray(converged, dtype=bool)
+        recovery_tolerance = np.where(
+            both_models_converged,
+            optimization_tolerance,
+            machine_tolerance,
+        )
+        needs_full_recovery = ~np.isfinite(full_nll) | (
+            np.isfinite(lrt_statistics) & (lrt_statistics < -recovery_tolerance)
         )
         if needs_full_recovery.any() and not refit_full:
             recovery_positions = np.flatnonzero(needs_full_recovery)
-            recovery_idx = fit_idx[recovery_positions]
-            recovery_size_factors = (
-                size_factors[:, recovery_positions]
-                if size_factors.ndim == 2
-                else size_factors
-            )
-            (
-                recovery_beta,
-                recovery_mu,
-                _,
-                recovery_converged,
-            ) = fit_inference.irls(
-                counts=counts[:, recovery_idx],
-                size_factors=recovery_size_factors,
-                design_matrix=full_design,
-                disp=dispersions[recovery_idx],
-                min_mu=self.min_mu,
-                beta_tol=self.beta_tol,
-            )
-            full_lfcs.iloc[recovery_idx] = recovery_beta
-            full_converged.iloc[recovery_idx] = recovery_converged
-            recovered_full_nll = np.atleast_1d(
-                np.asarray(
-                    nb_nll(
-                        counts[:, recovery_idx],
-                        recovery_mu,
-                        dispersions[recovery_idx],
-                    ),
-                    dtype=float,
+            for start in range(0, len(recovery_positions), block_size):
+                block_positions = recovery_positions[start : start + block_size]
+                recovery_idx = fit_idx[block_positions]
+                recovery_counts = counts[:, recovery_idx]
+                recovery_factors = self._get_normalization_factors(recovery_idx)
+                (
+                    recovery_beta,
+                    recovery_mu,
+                    _,
+                    recovery_converged,
+                ) = fit_inference.irls(
+                    counts=recovery_counts,
+                    size_factors=recovery_factors,
+                    design_matrix=full_design,
+                    disp=dispersions[recovery_idx],
+                    min_mu=self.min_mu,
+                    beta_tol=self.beta_tol,
                 )
-            )
-            full_nll[recovery_positions] = recovered_full_nll
-            lrt_statistics[recovery_positions] = 2 * (
-                reduced_nll[recovery_positions] - recovered_full_nll
-            )
+                full_lfcs.iloc[recovery_idx] = recovery_beta
+                full_converged.iloc[recovery_idx] = list(
+                    np.asarray(recovery_converged, dtype=bool)
+                )
+                full_nll[block_positions] = self._lrt_nb_nll(
+                    recovery_counts,
+                    recovery_mu,
+                    dispersions[recovery_idx],
+                )
+                del recovery_mu, _
+
+            lrt_statistics = 2 * (reduced_nll - full_nll)
 
         full_status = full_converged.iloc[fit_idx]
         full_failed = full_status.notna().to_numpy() & ~full_status.fillna(
@@ -1485,7 +1439,7 @@ class DeseqDataSet(ad.AnnData):
             warnings.warn(
                 "The full-model fit did not converge for "
                 f"{int(full_failed.sum())} gene(s); inspect "
-                "'_lrt_full_converged' before interpreting those results.",
+                "DeseqStats.full_converged before interpreting those results.",
                 UserWarning,
                 stacklevel=2,
             )
@@ -1559,6 +1513,7 @@ class DeseqDataSet(ad.AnnData):
         reduced_design: pd.DataFrame,
         reduced: str | pd.DataFrame,
         results: _LRTResult,
+        fit_digest: str | None = None,
     ) -> None:
         """Store the default LRT result in serialization-safe AnnData slots."""
         (
@@ -1582,50 +1537,38 @@ class DeseqDataSet(ad.AnnData):
         self.var["_lrt_full_converged"] = full_converged.array
         self.var["_lrt_new_all_zero"] = new_all_zero.to_numpy(dtype=bool)
         self.varm[_LRT_FULL_LFC_KEY] = full_lfcs.copy()
-        fit_generation = self._coerce_lrt_fit_generation(
-            self.uns.get("_fit_generation", 0)
-        )
-        if fit_generation is None:
+        fit_generation = self.uns.get("_fit_generation", 0)
+        if isinstance(fit_generation, (bool, np.bool_)) or not isinstance(
+            fit_generation, (int, np.integer)
+        ):
             fit_generation = 0
-        self.uns["_fit_generation"] = np.int64(fit_generation)
+        fit_generation = int(fit_generation)
+        self.uns["_fit_generation"] = fit_generation
         reduced_formula = reduced if isinstance(reduced, str) else ""
         input_digest = self._lrt_input_digest(
             cast(pd.DataFrame, self.obsm["_lrt_reduced_design_matrix"]),
             reduced_formula,
+            fit_digest,
         )
-        output_digest = self._lrt_output_digest()
-        if input_digest is None or output_digest is None:
+        if input_digest is None:
             raise RuntimeError("Could not construct serialization-safe LRT provenance.")
-        full_design = self.obsm.get("design_matrix")
-        if not isinstance(full_design, pd.DataFrame):
-            raise RuntimeError("LRT requires a DataFrame-backed full design.")
-        lrt_metadata: dict[str, str | np.int64 | np.ndarray] = {
+        lrt_metadata: dict[str, str | np.int64] = {
             "cache_version": np.int64(_LRT_CACHE_VERSION),
-            "df": np.int64(full_design.shape[1] - reduced_design.shape[1]),
+            "df": np.int64(
+                self.obsm["design_matrix"].shape[1] - reduced_design.shape[1]
+            ),
             "reduced_formula": reduced_formula,
             "fit_generation": np.int64(fit_generation),
-            "full_design_columns": np.asarray(
-                [str(column) for column in full_design.columns]
-            ),
-            "full_design_values": full_design.to_numpy(dtype=float, copy=True),
-            "obs_names": np.asarray([str(name) for name in self.obs_names]),
-            "reduced_design_columns": np.asarray(
-                [str(column) for column in reduced_design.columns]
-            ),
-            "var_names": np.asarray([str(name) for name in self.var_names]),
             "input_sha256": input_digest,
-            "output_sha256": output_digest,
         }
         self.uns["_lrt"] = lrt_metadata
 
-    def _lrt_cache_matches(self, reduced_design: pd.DataFrame) -> bool:
-        """Return whether serialized LRT results match current fitted state."""
-        if (
-            not self._lrt_fit_state_matches()
-            or "_lrt_reduced_design_matrix" not in self.obsm
-            or any(key not in self.var for key in _LRT_VAR_KEYS)
-            or _LRT_FULL_LFC_KEY not in self.varm
-        ):
+    def _lrt_cache_matches(
+        self,
+        reduced_design: pd.DataFrame,
+    ) -> bool:
+        """Return whether serialized LRT results use this reduced design."""
+        if "_lrt_reduced_design_matrix" not in self.obsm:
             return False
 
         stored = self.obsm["_lrt_reduced_design_matrix"]
@@ -2010,8 +1953,6 @@ class DeseqDataSet(ad.AnnData):
             `DeseqDataSet` `control_genes` attribute.
             (default: ``None``).
         """
-        self._invalidate_lrt_cache(discard_replace_counts=True)
-
         if fit_type is None:
             fit_type = self.size_factors_fit_type
         if not self.quiet:
@@ -2032,17 +1973,23 @@ class DeseqDataSet(ad.AnnData):
         _control_mask = self._make_control_mask(control_genes)
         normalization_control_mask = _control_mask.copy()
 
-        if "avg_tx_length" not in self.layers and "normalization_factors" in self.layers:
-            del self.layers["normalization_factors"]
-
+        transcript_fit_type: Literal["ratio", "poscounts"] | None = None
         if "avg_tx_length" in self.layers:
             if fit_type == "iterative":
                 raise ValueError(
                     "The iterative size-factor method does not support "
                     "transcript-length normalization. Use 'ratio' or 'poscounts'."
                 )
+            transcript_fit_type = fit_type
+
+        self._invalidate_lrt_cache(discard_replace_counts=True)
+
+        if transcript_fit_type is None and "normalization_factors" in self.layers:
+            del self.layers["normalization_factors"]
+
+        if transcript_fit_type is not None:
             self._fit_transcript_length_factors(
-                fit_type=fit_type,
+                fit_type=transcript_fit_type,
                 control_mask=_control_mask,
             )
 
@@ -2548,8 +2495,8 @@ class DeseqDataSet(ad.AnnData):
 
         Builds an AnnData object from the DESeqDataSet with the same data, but converts
         the design matrix to a DataFrame to remove the formulaic model_spec attribute
-        and top-level pandas Series in unstructured metadata to NumPy arrays.
-        These conversions do not mutate the DeseqDataSet.
+        and internal dispersion-trend Series to NumPy arrays. These conversions do not
+        mutate the DeseqDataSet or user-provided unstructured metadata.
 
         Returns
         -------
@@ -2557,7 +2504,8 @@ class DeseqDataSet(ad.AnnData):
             The AnnData object, without DeseqDataSet unpicklable attributes.
         """
         serializable_uns = dict(self.uns)
-        for key, value in serializable_uns.items():
+        for key in ("trend_coeffs", "vst_trend_coeffs"):
+            value = serializable_uns.get(key)
             if isinstance(value, pd.Series):
                 serializable_uns[key] = value.to_numpy(copy=True)
 
@@ -2767,19 +2715,20 @@ class DeseqDataSet(ad.AnnData):
         cooks_cutoff = f.ppf(0.99, num_vars, num_samples - num_vars)
         idx = self.layers["cooks"] > cooks_cutoff
         self.var["replaced"] = idx.any(axis=0)
+        replaced = self.var["replaced"].to_numpy(dtype=bool)
 
-        if sum(self.var["replaced"] > 0):
+        if replaced.any():
             if _REPLACE_COUNTS_LAYER in self.layers:
                 raise ValueError(
-                    "Cook replacement cannot create layers['replace_counts'] because "
-                    "that name is already used by a layer not owned by PyDESeq2. "
-                    "Rename or remove the existing layer before refitting outliers."
+                    "Cook replacement cannot create its private delta layer because "
+                    "that key is already used by state not owned by PyDESeq2."
                 )
 
             # Compute replacement counts: trimmed means * normalization factors
-            self.counts_to_refit = self[:, self.var["replaced"]].copy()
+            self.counts_to_refit = self[:, replaced].copy()
             if hasattr(self.counts_to_refit.X, "toarray"):
                 self.counts_to_refit.X = self.counts_to_refit.X.toarray()
+            refit_counts = np.asarray(self.counts_to_refit.X)
             normalization_factors = self._get_normalization_factors(
                 self.var["replaced"].to_numpy()
             )
@@ -2788,34 +2737,42 @@ class DeseqDataSet(ad.AnnData):
 
             trim_base_mean = np.asarray(
                 trimmed_mean(
-                    self.counts_to_refit.X / normalization_factors,
+                    refit_counts / normalization_factors,
                     trim=0.2,
                     axis=0,
                 )
             )
-            replacement_counts = np.asarray(
-                trim_base_mean[None, :] * normalization_factors,
-                dtype=int,
+            replacement_mask = (
+                self.obs["replaceable"].to_numpy(dtype=bool)[:, None] & idx[:, replaced]
             )
+            changed_rows, changed_local_columns = np.nonzero(replacement_mask)
+            original_values = refit_counts[changed_rows, changed_local_columns].astype(
+                np.int64, copy=True
+            )
+            if normalization_factors.shape[1] == 1:
+                replacement_factors = normalization_factors[changed_rows, 0]
+            else:
+                replacement_factors = normalization_factors[
+                    changed_rows, changed_local_columns
+                ]
+            replacement_values = np.asarray(
+                trim_base_mean[changed_local_columns] * replacement_factors,
+                dtype=np.int64,
+            )
+            refit_counts[changed_rows, changed_local_columns] = replacement_values
 
-            self.counts_to_refit.X[
-                self.obs["replaceable"].values[:, None] & idx[:, self.var["replaced"]]
-            ] = replacement_counts[
-                self.obs["replaceable"].values[:, None] & idx[:, self.var["replaced"]]
-            ]
-            replace_counts = self.X
-            if replace_counts is None:
-                raise RuntimeError("Cook replacement requires a count matrix.")
-            if hasattr(replace_counts, "toarray"):
-                replace_counts = replace_counts.toarray()
-            replace_counts = np.asarray(replace_counts).copy()
-            refit_counts = self.counts_to_refit.X
-            if refit_counts is None:
-                raise RuntimeError("Cook replacement requires refitted counts.")
-            if hasattr(refit_counts, "toarray"):
-                refit_counts = refit_counts.toarray()
-            replace_counts[:, self.var["replaced"].to_numpy()] = refit_counts
-            self.layers[_REPLACE_COUNTS_LAYER] = replace_counts
+            delta_values = replacement_values - original_values
+            changed = delta_values != 0
+            changed_rows = changed_rows[changed]
+            changed_columns = np.flatnonzero(replaced)[changed_local_columns[changed]]
+            self.layers[_REPLACE_COUNTS_LAYER] = csr_matrix(
+                (
+                    delta_values[changed],
+                    (changed_rows, changed_columns),
+                ),
+                shape=self.shape,
+                dtype=np.int64,
+            )
             self.uns[_REPLACE_COUNTS_OWNER_KEY] = True
 
     def _refit_without_outliers(

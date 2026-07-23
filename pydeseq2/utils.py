@@ -147,6 +147,8 @@ def test_valid_counts(
         raise ValueError("The count matrix should only contain integers.")
     if (counts < 0).any().any():
         raise ValueError("The count matrix should only contain non-negative values.")
+    if (counts >= 2**63).any().any():
+        raise ValueError("The count matrix values must fit in a signed 64-bit integer.")
 
 
 def dispersion_trend(

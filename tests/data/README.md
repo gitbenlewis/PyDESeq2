@@ -40,9 +40,8 @@ the following files under `tests/data/lrt/`:
   retaining a parametric dispersion trend;
 - `r_lrt_outlier_replace_counts.csv`: the count matrix after DESeq2's outlier
   replacement; and
-- `r_lrt_manifest.csv` and `lrt_session_info.txt`: model definitions, seeds,
-  outlier magnitude, and R package versions needed to audit or regenerate the
-  fixtures.
+- `lrt_session_info.txt`: the R package versions needed to audit or regenerate
+  the fixtures.
 
 The `log2FoldChange` and `lfcSE` columns in these files correspond to the
 explicit contrast passed to `results()`. The `stat`, `pvalue`, and `padj`

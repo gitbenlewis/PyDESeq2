@@ -412,38 +412,11 @@ ds_lrt.summary()
 # factor with more than two levels, because the LRT jointly tests all added
 # coefficients.
 #
-# The test can equivalently be selected at the
-# :meth:`~pydeseq2.dds.DeseqDataSet.deseq2` entry point:
+# The test can also be prepared during model fitting; see
+# :meth:`~pydeseq2.dds.DeseqDataSet.deseq2`.
 #
-# .. code-block:: python
-#
-#    lrt_dds = DeseqDataSet(
-#        counts=counts_df,
-#        metadata=metadata,
-#        design="~group + condition",
-#        refit_cooks=True,
-#        inference=inference,
-#    )
-#    lrt_dds.deseq2(test="LRT", reduced="~group")
-#    lrt_ds = DeseqStats(
-#        lrt_dds,
-#        contrast=["condition", "B", "A"],
-#        inference=inference,
-#    )
-#    lrt_ds.summary()
-#
-# In both forms, ``reduced`` is required, must be nested in the full design, and must
-# contain fewer coefficients. PyDESeq2 currently implements the classical
-# negative-binomial LRT with a chi-square reference distribution. Quasi-likelihood
-# variants are not included. The Wald-only ``lfc_null``, ``alt_hypothesis``,
-# and ``prior_LFC_var`` options cannot be used with an LRT.
-#
-# If Cook's outlier refitting replaces counts, PyDESeq2 retains the effective count
-# matrix in its internally managed ``dds.layers["replace_counts"]`` layer so the full
-# and reduced models use identical data. The ``"replace_counts"`` name is therefore
-# reserved for such a fit: a user-owned layer with that name causes replacement to
-# raise instead of being overwritten. Retaining this full matrix adds memory even
-# when ``low_memory=True``.
+# ``reduced`` must be nested in the full design and contain fewer coefficients.
+# Wald-only null-hypothesis options are not supported by an LRT.
 
 # %%
 # LFC shrinkage (multifactor)

@@ -16,6 +16,7 @@ from scipy.sparse import dia_array
 from scipy.sparse import dia_matrix
 from scipy.sparse import dok_array
 from scipy.sparse import dok_matrix
+from scipy.sparse import issparse
 from scipy.sparse import lil_array
 from scipy.sparse import lil_matrix
 
@@ -116,8 +117,11 @@ def assert_fit_state_cleared(dds):
             "refitted",
         }
     )
-    assert set(dds.obsm).isdisjoint({"_mu_LFC", "_hat_diagonals"})
-    assert "LFC" not in dds.varm
+    assert not any(str(column).startswith("_lrt_") for column in dds.var)
+    assert set(dds.obsm).isdisjoint(
+        {"_mu_LFC", "_hat_diagonals", "_lrt_reduced_design_matrix"}
+    )
+    assert set(dds.varm).isdisjoint({"LFC", "_lrt_full_LFC"})
     assert set(dds.layers).isdisjoint(
         {
             "normalization_factors",
@@ -127,6 +131,7 @@ def assert_fit_state_cleared(dds):
             "cooks",
             "replace_cooks",
             "vst_counts",
+            "_pydeseq2_cook_replacement_delta",
         }
     )
     assert set(dds.uns).isdisjoint(
@@ -137,6 +142,9 @@ def assert_fit_state_cleared(dds):
             "disp_function_type",
             "_squared_logres",
             "prior_disp_var",
+            "_deseq2_test",
+            "_lrt",
+            "_pydeseq2_replace_counts_owned",
         }
     )
     for attr in (
@@ -898,6 +906,38 @@ def test_explicit_transcript_lengths_clear_inherited_fitted_state():
     )
 
 
+def test_explicit_transcript_lengths_clear_inherited_lrt_state():
+    counts = load_example_data("raw_counts", "synthetic", debug=False)
+    counts.loc["sample1", "gene1"] = 200
+    metadata = load_example_data("metadata", "synthetic", debug=False)
+    transcript_lengths = varying_transcript_lengths(counts)
+    fitted_dds = DeseqDataSet(
+        counts=counts,
+        metadata=metadata,
+        transcript_lengths=transcript_lengths,
+        design="~0 + condition",
+        fit_type="mean",
+        refit_cooks=True,
+        n_cpus=1,
+        quiet=True,
+    )
+    fitted_dds.deseq2(test="LRT", reduced="~1")
+
+    replacement_lengths = transcript_lengths.copy()
+    replacement_lengths.iloc[:, 0] *= np.linspace(1.0, 2.0, len(replacement_lengths))
+    dds = DeseqDataSet(
+        adata=fitted_dds,
+        transcript_lengths=replacement_lengths,
+        design="~0 + condition",
+        fit_type="mean",
+        refit_cooks=True,
+        n_cpus=1,
+        quiet=True,
+    )
+
+    assert_fit_state_cleared(dds)
+
+
 def test_inherited_fit_requires_complete_configuration_provenance():
     class CustomInference(DefaultInference):
         pass
@@ -1013,6 +1053,15 @@ def test_cooks_outlier_refit_preserves_matrix_factors():
         reference_dds.varm["LFC"].loc[reference_dds.var_names[refitted]],
     )
     assert isinstance(dds.X, csr_matrix)
+    replacement_delta = dds.layers["_pydeseq2_cook_replacement_delta"]
+    assert issparse(replacement_delta)
+    assert replacement_delta.shape == dds.shape
+    assert 0 < replacement_delta.nnz < np.prod(dds.shape)
+    assert issparse(dds._effective_counts())
+    np.testing.assert_array_equal(
+        dds._effective_counts().toarray(),
+        np.asarray(reference_dds._effective_counts()),
+    )
 
     source_lfc = dds.varm["LFC"].copy()
     restored_dds = DeseqDataSet(

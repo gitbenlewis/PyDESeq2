@@ -102,3 +102,11 @@ def test_valid_dia_counts_ignore_padding(sparse_constructor):
 def test_invalid_general_sparse_counts(value, message):
     with pytest.raises(ValueError, match=message):
         validate_counts(dok_matrix([[value]]))
+
+
+@pytest.mark.parametrize("constructor", [np.asarray, coo_matrix])
+def test_counts_must_fit_in_signed_int64(constructor):
+    counts = constructor([[np.uint64(2**63)]])
+
+    with pytest.raises(ValueError, match="signed 64-bit integer"):
+        validate_counts(counts)
