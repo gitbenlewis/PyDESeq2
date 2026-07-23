@@ -15,6 +15,41 @@ from pydeseq2.inference import Inference
 from pydeseq2.utils import lowess
 from pydeseq2.utils import make_MA_plot
 
+_WALD_ALTERNATIVES = {
+    "greaterAbs",
+    "greaterAbs2014",
+    "greaterAbsUPSHOT",
+    "lessAbs",
+    "greater",
+    "less",
+}
+_ABSOLUTE_WALD_ALTERNATIVES = {
+    "greaterAbs",
+    "greaterAbs2014",
+    "greaterAbsUPSHOT",
+    "lessAbs",
+}
+
+
+def _validate_wald_test_arguments(lfc_null: float, alt_hypothesis: str | None) -> None:
+    """Validate the LFC null and alternative hypothesis for a Wald test."""
+    if alt_hypothesis is not None and alt_hypothesis not in _WALD_ALTERNATIVES:
+        raise ValueError(
+            f"Unknown alternative hypothesis {alt_hypothesis!r}. Expected one of "
+            f"{sorted(_WALD_ALTERNATIVES)} or None."
+        )
+    if not isinstance(
+        lfc_null, (int, float, np.integer, np.floating)
+    ) or not np.isfinite(lfc_null):
+        raise ValueError("lfc_null must be a finite scalar.")
+    if lfc_null < 0 and alt_hypothesis in _ABSOLUTE_WALD_ALTERNATIVES:
+        raise ValueError(
+            f"The {alt_hypothesis!r} alternative requires a non-negative lfc_null "
+            f"(got {lfc_null})."
+        )
+    if lfc_null == 0 and alt_hypothesis == "lessAbs":
+        raise ValueError("The 'lessAbs' alternative requires a positive lfc_null.")
+
 
 class DeseqStats:
     """PyDESeq2 statistical tests for differential expression.
@@ -60,9 +95,15 @@ class DeseqStats:
         The alternative hypothesis for computing wald p-values. By default, the normal
         Wald test assesses deviation of the estimated log fold change from the null
         hypothesis, as given by ``lfc_null``.
-        One of ``["greaterAbs", "lessAbs", "greater", "less"]`` or ``None``.
-        The alternative hypothesis corresponds to what the user wants to find rather
-        than the null hypothesis. (default: ``None``).
+        One of ``["greaterAbs", "greaterAbs2014", "greaterAbsUPSHOT",
+        "lessAbs", "greater", "less"]`` or ``None``. The one-sided alternatives
+        use ``lfc_null`` as a signed boundary: ``greater`` tests above it and ``less``
+        tests below it. For example, use ``lfc_null=-0.5`` with ``less`` to test for
+        log2 fold changes below -0.5. The absolute alternatives use a non-negative
+        threshold: ``greaterAbs`` follows the current DESeq2 method,
+        ``greaterAbs2014`` preserves the historical method, ``greaterAbsUPSHOT`` uses
+        the current DESeq2 UPSHOT method, and ``lessAbs`` tests equivalence within the
+        threshold. (default: ``None``).
 
     inference : Inference
         Implementation of inference routines object instance.
@@ -138,7 +179,15 @@ class DeseqStats:
         prior_LFC_var: np.ndarray | None = None,
         lfc_null: float = 0.0,
         alt_hypothesis: (
-            Literal["greaterAbs", "lessAbs", "greater", "less"] | None
+            Literal[
+                "greaterAbs",
+                "greaterAbs2014",
+                "greaterAbsUPSHOT",
+                "lessAbs",
+                "greater",
+                "less",
+            ]
+            | None
         ) = None,
         inference: Inference | None = None,
         quiet: bool = False,
@@ -156,11 +205,7 @@ class DeseqStats:
         self.base_mean = self.dds.var["_normed_means"].copy()
         self.prior_LFC_var = prior_LFC_var
 
-        if lfc_null < 0 and alt_hypothesis in {"greaterAbs", "lessAbs"}:
-            raise ValueError(
-                f"The alternative hypothesis being {alt_hypothesis}, please provide a",
-                f"positive lfc_null value (got {lfc_null}).",
-            )
+        _validate_wald_test_arguments(lfc_null, alt_hypothesis)
         self.lfc_null = lfc_null
         self.alt_hypothesis = alt_hypothesis
 
@@ -177,12 +222,22 @@ class DeseqStats:
                 The "contrast" argument must be provided."""
             )
         elif isinstance(contrast, np.ndarray):
+            if contrast.ndim != 1:
+                raise ValueError("The contrast vector must be one-dimensional.")
             if contrast.shape[0] != self.dds.obsm["design_matrix"].shape[1]:
                 raise ValueError(
                     "The contrast vector must have the same length as the design matrix."
                 )
+            if contrast.dtype.kind not in {"i", "u", "f"}:
+                raise ValueError("The contrast vector must contain real numbers.")
+            with np.errstate(over="ignore", invalid="ignore"):
+                contrast = contrast.astype(float, copy=False)
+            if not np.all(np.isfinite(contrast)):
+                raise ValueError("The contrast vector must contain only finite values.")
+            if not np.any(contrast):
+                raise ValueError("The contrast vector must contain a non-zero element.")
             self.contrast = contrast
-            self.contrast_vector = contrast
+            self.contrast_vector = self.contrast
         else:
             self.contrast = contrast
             self._build_contrast_vector()
@@ -246,11 +301,7 @@ class DeseqStats:
             alt_hypothesis = self.alt_hypothesis
         else:
             alt_hypothesis = new_alt_hypothesis
-        if lfc_null < 0 and alt_hypothesis in {"greaterAbs", "lessAbs"}:
-            raise ValueError(
-                f"The alternative hypothesis being {alt_hypothesis}, please provide a",
-                f"positive lfc_null value (got {lfc_null}).",
-            )
+        _validate_wald_test_arguments(lfc_null, alt_hypothesis)
 
         if (
             not hasattr(self, "p_values")

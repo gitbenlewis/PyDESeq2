@@ -739,7 +739,17 @@ def wald_test(
     ridge_factor: np.ndarray,
     contrast: np.ndarray,
     lfc_null: float,
-    alt_hypothesis: Literal["greaterAbs", "lessAbs", "greater", "less"] | None,
+    alt_hypothesis: (
+        Literal[
+            "greaterAbs",
+            "greaterAbs2014",
+            "greaterAbsUPSHOT",
+            "lessAbs",
+            "greater",
+            "less",
+        ]
+        | None
+    ),
 ) -> tuple[float, float, float]:
     """Run Wald test for differential expression.
 
@@ -767,7 +777,7 @@ def wald_test(
         Vector encoding the contrast that is being tested.
 
     lfc_null : float
-        The (log2) log fold change under the null hypothesis.
+        The log fold change under the null hypothesis, in natural log scale.
 
     alt_hypothesis : str, optional
         The alternative hypothesis for computing wald p-values.
@@ -788,40 +798,78 @@ def wald_test(
     M = (design_matrix.T * W[None, :]) @ design_matrix
     H = np.linalg.inv(M + ridge_factor)
     Hc = H @ contrast
-    # Evaluate standard error and Wald statistic
+    # Evaluate the full contrast estimate and its standard error before applying any
+    # threshold. Thresholding individual coefficients first is not invariant to model
+    # parameterization and gives incorrect results for multi-coefficient contrasts.
+    contrast_lfc = float(contrast @ lfc)
     wald_se: float = np.sqrt(Hc.T @ M @ Hc)
 
-    def greater(lfc_null):
-        stat = contrast @ np.fmax((lfc - lfc_null) / wald_se, 0)
-        pval = norm.sf(stat)
+    def greater(lfc_null: float) -> tuple[float, float]:
+        standardized_distance = (contrast_lfc - lfc_null) / wald_se
+        stat = max(standardized_distance, 0.0)
+        # The p-value uses the unclipped distance. On the null side it may be > 0.5.
+        pval = norm.sf(standardized_distance)
         return stat, pval
 
-    def less(lfc_null):
-        stat = contrast @ np.fmin((lfc - lfc_null) / wald_se, 0)
-        pval = norm.sf(np.abs(stat))
+    def less(lfc_null: float) -> tuple[float, float]:
+        standardized_distance = (contrast_lfc - lfc_null) / wald_se
+        stat = min(standardized_distance, 0.0)
+        # PyDESeq2 uses a signed null for this test (for example, -0.5 for beta < -0.5).
+        pval = norm.cdf(standardized_distance)
         return stat, pval
 
-    def greater_abs(lfc_null):
-        stat = contrast @ (np.sign(lfc) * np.fmax((np.abs(lfc) - lfc_null) / wald_se, 0))
-        pval = 2 * norm.sf(np.abs(stat))  # Only case where the test is two-tailed
+    def greater_abs(lfc_null: float) -> tuple[float, float]:
+        abs_lfc = abs(contrast_lfc)
+        stat = contrast_lfc / wald_se
+        pval = norm.sf((abs_lfc - lfc_null) / wald_se) + norm.sf(
+            (abs_lfc + lfc_null) / wald_se
+        )
         return stat, pval
 
-    def less_abs(lfc_null):
-        stat_above, pval_above = greater(-abs(lfc_null))
-        stat_below, pval_below = less(abs(lfc_null))
-        return min(stat_above, stat_below, key=abs), max(pval_above, pval_below)
+    def greater_abs_2014(lfc_null: float) -> tuple[float, float]:
+        standardized_distance = (abs(contrast_lfc) - lfc_null) / wald_se
+        stat = np.sign(contrast_lfc) * max(standardized_distance, 0.0)
+        pval = min(1.0, 2 * norm.sf(standardized_distance))
+        return stat, pval
+
+    def greater_abs_upshot(lfc_null: float) -> tuple[float, float]:
+        stat = contrast_lfc / wald_se
+        threshold_stat = lfc_null / wald_se
+        # The closed form below suffers from cancellation as its integration interval
+        # collapses. In that limit, UPSHOT is the ordinary two-sided Wald test.
+        if threshold_stat <= np.sqrt(np.finfo(float).eps):
+            return stat, 2 * norm.sf(abs(stat))
+
+        a = abs(stat) + threshold_stat
+        b = abs(stat) - threshold_stat
+        if a == b:
+            return stat, 2 * norm.sf(abs(stat))
+        pval = (2 / (b - a)) * (
+            -a * norm.cdf(-a) + norm.pdf(a) + b * norm.cdf(-b) - norm.pdf(b)
+        )
+        return stat, float(np.clip(pval, 0.0, 1.0))
+
+    def less_abs(lfc_null: float) -> tuple[float, float]:
+        distance_from_upper = (lfc_null - contrast_lfc) / wald_se
+        distance_from_lower = (contrast_lfc + lfc_null) / wald_se
+        stat = min(max(distance_from_upper, 0.0), max(distance_from_lower, 0.0))
+        pval = max(norm.sf(distance_from_upper), norm.sf(distance_from_lower))
+        return stat, pval
 
     wald_statistic: float
     wald_p_value: float
     if alt_hypothesis is not None:
-        wald_statistic, wald_p_value = {
-            "greaterAbs": greater_abs(lfc_null),
-            "lessAbs": less_abs(lfc_null),
-            "greater": greater(lfc_null),
-            "less": less(lfc_null),
+        wald_test_fn = {
+            "greaterAbs": greater_abs,
+            "greaterAbs2014": greater_abs_2014,
+            "greaterAbsUPSHOT": greater_abs_upshot,
+            "lessAbs": less_abs,
+            "greater": greater,
+            "less": less,
         }[alt_hypothesis]
+        wald_statistic, wald_p_value = wald_test_fn(lfc_null)
     else:
-        wald_statistic = float(contrast @ (lfc - lfc_null) / wald_se)
+        wald_statistic = (contrast_lfc - lfc_null) / wald_se
         wald_p_value = 2 * norm.sf(np.abs(wald_statistic))
 
     return wald_p_value, wald_statistic, wald_se
@@ -1324,7 +1372,17 @@ def make_MA_plot(
     log: bool = True,
     save_path: str | None = None,
     lfc_null: float = 0,
-    alt_hypothesis: Literal["greaterAbs", "lessAbs", "greater", "less"] | None = None,
+    alt_hypothesis: (
+        Literal[
+            "greaterAbs",
+            "greaterAbs2014",
+            "greaterAbsUPSHOT",
+            "lessAbs",
+            "greater",
+            "less",
+        ]
+        | None
+    ) = None,
     **kwargs,
 ) -> None:
     """
@@ -1382,7 +1440,12 @@ def make_MA_plot(
     plt.ylabel("log2 fold change")
 
     plt.axhline(lfc_null, color="red", alpha=0.5, linestyle="--", zorder=3)
-    if alt_hypothesis and alt_hypothesis in ["greaterAbs", "lessAbs"]:
+    if alt_hypothesis in {
+        "greaterAbs",
+        "greaterAbs2014",
+        "greaterAbsUPSHOT",
+        "lessAbs",
+    }:
         plt.axhline(-lfc_null, color="red", alpha=0.5, linestyle="--", zorder=3)
     plt.tight_layout()
 

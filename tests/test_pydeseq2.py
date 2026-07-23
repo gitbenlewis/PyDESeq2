@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 from formulaic import model_matrix
+from scipy.stats import norm
 
 import tests
 from pydeseq2.dds import DeseqDataSet
@@ -177,8 +178,18 @@ def test_deseq_without_independent_filtering_parametric_fit(
     assert_res_almost_equal(ds.results_df, r_res, tol)
 
 
-@pytest.mark.parametrize("alt_hypothesis", ["lessAbs", "greaterAbs", "less", "greater"])
-def test_alt_hypothesis(alt_hypothesis, counts_df, metadata, tol=0.02):
+@pytest.mark.parametrize(
+    "alt_hypothesis,reference_hypothesis",
+    [
+        ("lessAbs", "lessAbs"),
+        ("greaterAbs2014", "greaterAbs"),
+        ("less", "less"),
+        ("greater", "greater"),
+    ],
+)
+def test_alt_hypothesis(
+    alt_hypothesis, reference_hypothesis, counts_df, metadata, tol=0.02
+):
     """Test that the outputs of the DESeq2 function match those of the original R
     package, up to a tolerance in relative error, with the alternative hypothesis test.
     """
@@ -186,7 +197,10 @@ def test_alt_hypothesis(alt_hypothesis, counts_df, metadata, tol=0.02):
     test_path = str(Path(os.path.realpath(tests.__file__)).parent.resolve())
 
     r_res = pd.read_csv(
-        os.path.join(test_path, f"data/single_factor/r_test_res_{alt_hypothesis}.csv"),
+        os.path.join(
+            test_path,
+            f"data/single_factor/r_test_res_{reference_hypothesis}.csv",
+        ),
         index_col=0,
     )
 
@@ -208,21 +222,129 @@ def test_alt_hypothesis(alt_hypothesis, counts_df, metadata, tol=0.02):
     assert (ds.results_df.pvalue.isna() == r_res.pvalue.isna()).all()
     assert (ds.results_df.padj.isna() == r_res.padj.isna()).all()
 
-    # Check that the same LFC and Wald statistics are found (up to tol)
-    assert (
-        abs(r_res.log2FoldChange - ds.results_df.log2FoldChange)
-        / abs(r_res.log2FoldChange)
-    ).max() < tol
-    if alt_hypothesis == "lessAbs":
-        ds.results_df.stat = ds.results_df.stat.abs()
-    assert (abs(r_res.stat - ds.results_df.stat) / abs(r_res.stat)).max() < tol
-    # Check for the same pvalue and padj where stat != 0
-    assert (
-        abs(
-            r_res.pvalue[r_res.stat != 0] - ds.results_df.pvalue[ds.results_df.stat != 0]
+    # Check all outputs, including p-values whose reported statistic is clipped to 0.
+    # The greaterAbs fixture predates DESeq2 1.44 and now tests the explicitly named
+    # historical method, greaterAbs2014.
+    for column in ["log2FoldChange", "lfcSE", "stat", "pvalue", "padj"]:
+        np.testing.assert_allclose(
+            ds.results_df[column],
+            r_res[column],
+            rtol=tol,
+            atol=1e-8,
+            equal_nan=True,
         )
-        / r_res.pvalue[r_res.stat != 0]
-    ).max() < tol
+
+
+@pytest.mark.parametrize("alt_hypothesis", ["greaterAbs", "greaterAbsUPSHOT"])
+def test_current_greater_abs_methods(alt_hypothesis, counts_df, metadata):
+    """Check current DESeq2 absolute-threshold formulas through the public API."""
+    dds = DeseqDataSet(
+        counts=counts_df,
+        metadata=metadata,
+        design="~condition",
+        refit_cooks=False,
+        quiet=True,
+    )
+    dds.deseq2()
+
+    lfc_null = 0.5
+    ds = DeseqStats(
+        dds,
+        contrast=["condition", "B", "A"],
+        lfc_null=lfc_null,
+        alt_hypothesis=alt_hypothesis,
+        cooks_filter=False,
+        independent_filter=False,
+        quiet=True,
+    )
+    ds.summary()
+
+    lfc = ds.results_df["log2FoldChange"].to_numpy()
+    se = ds.results_df["lfcSE"].to_numpy()
+    expected_statistic = lfc / se
+    if alt_hypothesis == "greaterAbs":
+        expected_pvalue = norm.sf((np.abs(lfc) - lfc_null) / se) + norm.sf(
+            (np.abs(lfc) + lfc_null) / se
+        )
+    else:
+        a = (np.abs(lfc) + lfc_null) / se
+        b = (np.abs(lfc) - lfc_null) / se
+        expected_pvalue = (2 / (b - a)) * (
+            -a * norm.cdf(-a) + norm.pdf(a) + b * norm.cdf(-b) - norm.pdf(b)
+        )
+
+    np.testing.assert_allclose(ds.results_df["stat"], expected_statistic)
+    np.testing.assert_allclose(ds.results_df["pvalue"], expected_pvalue)
+
+
+def test_thresholded_contrasts_are_parameterization_invariant(counts_df, metadata):
+    """Check a three-level C-vs-B contrast in equivalent model parameterizations."""
+    metadata = metadata.copy()
+    metadata["condition3"] = pd.Categorical(np.repeat(["A", "B", "C"], [34, 33, 33]))
+    alternatives = [
+        None,
+        "greater",
+        "less",
+        "greaterAbs",
+        "greaterAbs2014",
+        "greaterAbsUPSHOT",
+        "lessAbs",
+    ]
+    results_by_design = {}
+
+    for design in ["~condition3", "~ 0 + condition3"]:
+        dds = DeseqDataSet(
+            counts=counts_df,
+            metadata=metadata,
+            design=design,
+            fit_type="mean",
+            refit_cooks=False,
+            quiet=True,
+        )
+        dds.deseq2()
+        design_results = {}
+
+        for alt_hypothesis in alternatives:
+            lfc_null = -0.5 if alt_hypothesis == "less" else 0.5
+            numeric = DeseqStats(
+                dds,
+                contrast=np.array([0.0, -1.0, 1.0]),
+                lfc_null=lfc_null,
+                alt_hypothesis=alt_hypothesis,
+                cooks_filter=False,
+                independent_filter=False,
+                quiet=True,
+            )
+            numeric.summary()
+            symbolic = DeseqStats(
+                dds,
+                contrast=["condition3", "C", "B"],
+                lfc_null=lfc_null,
+                alt_hypothesis=alt_hypothesis,
+                cooks_filter=False,
+                independent_filter=False,
+                quiet=True,
+            )
+            symbolic.summary()
+
+            np.testing.assert_allclose(
+                numeric.results_df,
+                symbolic.results_df,
+                rtol=2e-6,
+                atol=1e-8,
+                equal_nan=True,
+            )
+            design_results[alt_hypothesis] = numeric.results_df
+        results_by_design[design] = design_results
+
+    for alt_hypothesis in alternatives:
+        np.testing.assert_allclose(
+            results_by_design["~condition3"][alt_hypothesis],
+            results_by_design["~ 0 + condition3"][alt_hypothesis],
+            rtol=2e-6,
+            atol=1e-8,
+            equal_nan=True,
+        )
 
 
 def test_deseq_no_refit_cooks(counts_df, metadata, tol=0.02):

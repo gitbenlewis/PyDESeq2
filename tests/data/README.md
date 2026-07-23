@@ -9,6 +9,9 @@ in `/datasets/synthetic/`, respectively using `~condition` and `~condition + gro
 - `r_lfc_shrink.csv` contains DESeq2 results after running `lfcShrink`,
 - `r_test_dispersions.csv` contains DESeq2 dispersions estimates (post-filtering and refitting),
 - `r_test_res.csv` contains DESeq2's `results` output,
+- `r_test_res_{greater,greaterAbs,less,lessAbs}.csv` contain DESeq2's
+  threshold-test outputs; because these fixtures use DESeq2 1.34.0,
+  `r_test_res_greaterAbs.csv` represents the method now named `greaterAbs2014`,
 - `r_test_size_factors.csv` contains DESeq2's `estimateSizeFactors` output,
 - `r_vst.csv` contains DESeq2's `varianceStabilizingTransformation` output with `blind=TRUE` and `fitType="parametric"`,
 - `r_vst_with_design.csv` contains DESeq2's `varianceStabilizingTransformation` output with `blind=FALSE` and `fitType="parametric"`.

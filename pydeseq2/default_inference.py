@@ -191,9 +191,17 @@ class DefaultInference(inference.Inference):
         mu: np.ndarray,
         ridge_factor: np.ndarray,
         contrast: np.ndarray,
-        lfc_null: np.ndarray,
+        lfc_null: float,
         alt_hypothesis: (
-            Literal["greaterAbs", "lessAbs", "greater", "less"] | None
+            Literal[
+                "greaterAbs",
+                "greaterAbs2014",
+                "greaterAbsUPSHOT",
+                "lessAbs",
+                "greater",
+                "less",
+            ]
+            | None
         ) = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         num_genes = mu.shape[1]
@@ -210,7 +218,7 @@ class DefaultInference(inference.Inference):
                     mu=mu[:, i],
                     ridge_factor=ridge_factor,
                     contrast=contrast,
-                    lfc_null=lfc_null,  # Convert log2 to natural log
+                    lfc_null=lfc_null,
                     alt_hypothesis=alt_hypothesis,
                 )
                 for i in range(num_genes)

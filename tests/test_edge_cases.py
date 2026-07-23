@@ -285,6 +285,47 @@ def test_contrast():
     with pytest.raises(ValueError):
         DeseqStats(dds, contrast=np.array([0, 0, 0, 1]))
 
+    with pytest.raises(ValueError, match="one-dimensional"):
+        DeseqStats(dds, contrast=np.array([[0, 1, 0]]))
+    with pytest.raises(ValueError, match="real numbers"):
+        DeseqStats(dds, contrast=np.array([0, 1j, 0]))
+    with pytest.raises(ValueError, match="real numbers"):
+        DeseqStats(dds, contrast=np.array([0, 1, 0], dtype="timedelta64[D]"))
+    with pytest.raises(ValueError, match="finite values"):
+        DeseqStats(dds, contrast=np.array([0, np.nan, 0]))
+    with pytest.raises(ValueError, match="non-zero"):
+        DeseqStats(dds, contrast=np.zeros(3))
+
+    valid_contrast = np.array([0, 1, 0])
+    with pytest.raises(ValueError, match="Unknown alternative hypothesis"):
+        DeseqStats(dds, contrast=valid_contrast, alt_hypothesis="invalid")
+    with pytest.raises(ValueError, match="finite scalar"):
+        DeseqStats(dds, contrast=valid_contrast, lfc_null=np.nan)
+    for alt_hypothesis in [
+        "greaterAbs",
+        "greaterAbs2014",
+        "greaterAbsUPSHOT",
+        "lessAbs",
+    ]:
+        with pytest.raises(ValueError, match="non-negative"):
+            DeseqStats(
+                dds,
+                contrast=valid_contrast,
+                lfc_null=-0.5,
+                alt_hypothesis=alt_hypothesis,
+            )
+    with pytest.raises(ValueError, match="positive lfc_null"):
+        DeseqStats(
+            dds,
+            contrast=valid_contrast,
+            lfc_null=0.0,
+            alt_hypothesis="lessAbs",
+        )
+
+    ds = DeseqStats(dds, contrast=valid_contrast)
+    with pytest.raises(ValueError, match="Unknown alternative hypothesis"):
+        ds.summary(alt_hypothesis="invalid")
+
 
 def test_cooks_not_refitted():
     """Test that an AttributeError is thrown when a `DeseqStats` object is initialized

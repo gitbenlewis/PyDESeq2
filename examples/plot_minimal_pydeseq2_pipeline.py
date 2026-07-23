@@ -268,8 +268,11 @@ if SAVE:
 # The user can specify a (log2) log fold change under the null hypothesis and an
 # alternative hypothesis to re-compute Wald statistics and p-values.
 # The alternative hypothesis corresponds to what the user wants to find rather than the
-# null hypothesis. It can take one of the values
-# ``["greaterAbs", "lessAbs", "greater", "less"]``.
+# null hypothesis. It can take one of the values ``["greaterAbs",
+# "greaterAbs2014", "greaterAbsUPSHOT", "lessAbs", "greater", "less"]``.
+# ``greaterAbs`` follows current DESeq2, while ``greaterAbs2014`` preserves the
+# historical method. For one-sided tests, ``lfc_null`` is a signed boundary (for
+# example, use ``-0.5`` with ``less`` to test for a log2 fold change below -0.5).
 
 ds.summary(lfc_null=0.1, alt_hypothesis="greaterAbs")
 ds.plot_MA(s=20)
