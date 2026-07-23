@@ -128,7 +128,11 @@ def test_valid_counts(
         if not np.issubdtype(counts.to_numpy().dtype, np.number):
             raise ValueError("The count matrix should only contain numbers.")
     elif isinstance(counts, (spmatrix, sparray)):
-        values = np.asarray(cast(Any, counts).data)
+        sparse_counts = cast(Any, counts)
+        if sparse_counts.format not in {"coo", "csc", "csr"}:
+            values = np.asarray(sparse_counts.tocoo(copy=False).data)
+        else:
+            values = np.asarray(sparse_counts.data)
         if not np.issubdtype(values.dtype, np.number):
             raise ValueError("The count matrix should only contain numbers.")
         if np.isnan(values).any():

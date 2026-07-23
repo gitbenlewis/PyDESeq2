@@ -7,6 +7,7 @@ from joblib import Parallel  # type: ignore
 from joblib import delayed
 from joblib import parallel_backend
 from scipy.optimize import minimize  # type: ignore
+from scipy.sparse import issparse  # type: ignore
 
 from pydeseq2 import inference
 from pydeseq2 import utils
@@ -21,7 +22,7 @@ def _gene_factors(factors: np.ndarray, gene_idx: int) -> np.ndarray:
 
 def _gene_counts(counts: np.ndarray, gene_idx: int) -> np.ndarray:
     """Return one gene's counts as a dense sample vector."""
-    column = counts[:, gene_idx]
+    column = counts[:, [gene_idx]] if issparse(counts) else counts[:, gene_idx]
     if hasattr(column, "toarray"):
         column = column.toarray()
     return np.asarray(column).ravel()

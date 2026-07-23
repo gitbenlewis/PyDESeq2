@@ -49,6 +49,26 @@ jobs:
         if: matrix.python == '3.11'
         run: |
           uv run mypy -p pydeseq2
+      - name: Test SciPy 1.13 sparse compatibility
+        if: matrix.python == '3.11'
+        run: |
+          uv run --no-project --isolated --python 3.11 \
+            --with-editable . \
+            --with 'numpy==2.0.0' \
+            --with 'scipy==1.13.0' \
+            --with 'anndata==0.11.0' \
+            --with 'zarr<3' \
+            --with 'pytest==8.4.0' \
+            python -m pytest -q \
+            'tests/test_transcript_length_normalization.py::test_sparse_anndata_ratio_pipeline_matches_dense[csr_matrix]' \
+            'tests/test_transcript_length_normalization.py::test_sparse_anndata_ratio_pipeline_matches_dense[csr_array]' \
+            'tests/test_transcript_length_normalization.py::test_sparse_array_cooks_outlier[csr_array]' \
+            'tests/test_transcript_length_normalization.py::test_general_sparse_anndata_pipeline_matches_dense' \
+            'tests/test_transcript_length_normalization.py::test_general_sparse_transcript_length_counts' \
+            'tests/test_transcript_length_normalization.py::test_sparse_anndata_sums_duplicates_before_validation' \
+            'tests/test_utils.py::test_valid_sparse_count_formats' \
+            'tests/test_utils.py::test_valid_dia_counts_ignore_padding' \
+            'tests/test_utils.py::test_invalid_general_sparse_counts'
       - name: Test with pytest
         run: |
           uv run coverage run -m pytest

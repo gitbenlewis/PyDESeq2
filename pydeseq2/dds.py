@@ -38,7 +38,11 @@ def _rounded_counts(counts: Any) -> Any:
         return counts.round()
     if isinstance(counts, np.ndarray):
         return np.rint(counts)
-    rounded = counts.copy()
+    sparse_counts = cast(Any, counts)
+    if sparse_counts.format in {"csr", "csc"}:
+        rounded = sparse_counts.copy()
+    else:
+        rounded = sparse_counts.tocsr()
     rounded.sum_duplicates()
     rounded.data = np.rint(rounded.data)
     rounded.eliminate_zeros()
@@ -269,6 +273,7 @@ class DeseqDataSet(ad.AnnData):
         has_transcript_lengths = (
             selected_transcript_lengths is not None or has_stored_transcript_lengths
         )
+        preserve_inherited_fit = False
         if adata is not None:
             has_pytximport_fields = (
                 "length" in adata.obsm and "counts_from_abundance" in adata.uns
@@ -290,6 +295,12 @@ class DeseqDataSet(ad.AnnData):
             ):
                 selected_transcript_lengths = adata.obsm["length"]
 
+            preserve_inherited_fit = (
+                selected_transcript_lengths is None
+                and has_stored_transcript_lengths
+                and "normalization_factors" in adata.layers
+            )
+
             if adata.isbacked:
                 raise ValueError(
                     "DeseqDataSet requires an in-memory AnnData object. Call "
@@ -305,9 +316,17 @@ class DeseqDataSet(ad.AnnData):
                 warnings.warn(
                     "adata was provided; ignoring metadata.", UserWarning, stacklevel=2
                 )
-            prepared_counts: Any = (
-                _rounded_counts(adata.X) if has_transcript_lengths else adata.X
-            )
+            prepared_counts: Any = adata.X
+            if has_transcript_lengths:
+                prepared_counts = _rounded_counts(prepared_counts)
+            elif issparse(prepared_counts):
+                sparse_counts = cast(Any, prepared_counts)
+                if sparse_counts.format not in {"csr", "csc"}:
+                    prepared_counts = sparse_counts.tocsr()
+                    prepared_counts.sum_duplicates()
+                elif not sparse_counts.has_canonical_format:
+                    prepared_counts = sparse_counts.copy()
+                    prepared_counts.sum_duplicates()
             # Test counts before going further
             test_valid_counts(prepared_counts)
             integer_counts = prepared_counts.astype(int)
@@ -339,6 +358,10 @@ class DeseqDataSet(ad.AnnData):
             else:
                 # Preserve the existing AnnData initialization behavior.
                 self.__dict__.update(adata.__dict__)
+                # AnnData 0.13 stores X under the None layer key. Detach the
+                # container so assigning self.X does not modify the input AnnData.
+                if None in self.__dict__.get("_layers", {}):
+                    self.__dict__["_layers"] = self.__dict__["_layers"].copy()
                 self.X = integer_counts
         elif counts is not None and metadata is not None:
             expected_length_index = counts.index
@@ -375,56 +398,6 @@ class DeseqDataSet(ad.AnnData):
                 )
             self._validate_transcript_lengths(transcript_lengths_array)
             self.layers["avg_tx_length"] = transcript_lengths_array
-            if adata is not None and transcript_lengths is not None:
-                # Invalidate fitting state derived from copied normalization factors.
-                for column in ("size_factors", "replaceable"):
-                    if column in self.obs:
-                        del self.obs[column]
-                for column in (
-                    "_normed_means",
-                    "non_zero",
-                    "_MoM_dispersions",
-                    "genewise_dispersions",
-                    "vst_genewise_dispersions",
-                    "_genewise_converged",
-                    "fitted_dispersions",
-                    "MAP_dispersions",
-                    "_MAP_converged",
-                    "dispersions",
-                    "_outlier_genes",
-                    "_LFC_converged",
-                    "replaced",
-                    "refitted",
-                    "_pvalue_cooks_outlier",
-                ):
-                    if column in self.var:
-                        del self.var[column]
-                for layer in (
-                    "normalization_factors",
-                    "normed_counts",
-                    "_mu_hat",
-                    "_vst_mu_hat",
-                    "vst_counts",
-                    "cooks",
-                    "replace_cooks",
-                ):
-                    if layer in self.layers:
-                        del self.layers[layer]
-                for key in ("_mu_LFC", "_hat_diagonals"):
-                    if key in self.obsm:
-                        del self.obsm[key]
-                if "LFC" in self.varm:
-                    del self.varm["LFC"]
-                for key in (
-                    "trend_coeffs",
-                    "vst_trend_coeffs",
-                    "mean_disp",
-                    "disp_function_type",
-                    "_squared_logres",
-                    "prior_disp_var",
-                ):
-                    if key in self.uns:
-                        del self.uns[key]
         elif "avg_tx_length" in self.layers:
             stored_lengths = self.layers["avg_tx_length"]
             transcript_lengths_array = (
@@ -490,6 +463,108 @@ class DeseqDataSet(ad.AnnData):
         # Check that the design matrix has full rank
         self._check_full_rank_design()
 
+        if preserve_inherited_fit and adata is not None:
+            source_design = adata.obsm.get("design_matrix")
+            normalization_control_mask = np.ones(self.n_vars, dtype=bool)
+            if control_genes is not None:
+                normalization_control_mask[:] = False
+                normalization_control_mask[
+                    self._normalize_indices((slice(None), control_genes))[1]
+                ] = True
+            fit_settings = (
+                ("fit_type", fit_type),
+                ("min_mu", min_mu),
+                ("min_disp", min_disp),
+                ("max_disp", np.maximum(max_disp, self.n_obs)),
+                ("refit_cooks", refit_cooks),
+                ("min_replicates", min_replicates),
+                ("beta_tol", beta_tol),
+            )
+            preserve_inherited_fit = (
+                isinstance(source_design, pd.DataFrame)
+                and cast(pd.DataFrame, self.obsm["design_matrix"]).equals(source_design)
+                and all(
+                    hasattr(adata, attr)
+                    and np.array_equal(
+                        np.asarray(getattr(adata, attr)), np.asarray(value)
+                    )
+                    for attr, value in fit_settings
+                )
+                and getattr(adata, "_normalization_fit_type", None)
+                == size_factors_fit_type
+                and hasattr(adata, "_normalization_control_mask")
+                and np.array_equal(
+                    adata._normalization_control_mask,
+                    normalization_control_mask,
+                )
+                and (
+                    (
+                        inference is None
+                        and hasattr(adata, "inference")
+                        and type(adata.inference) is DefaultInference
+                    )
+                    or (
+                        inference is not None
+                        and hasattr(adata, "inference")
+                        and inference is adata.inference
+                    )
+                )
+            )
+
+        invalidate_inherited_fit = (
+            adata is not None and has_transcript_lengths and not preserve_inherited_fit
+        )
+        if invalidate_inherited_fit:
+            # Invalidate fitting state derived from copied normalization factors.
+            for column in ("size_factors", "replaceable"):
+                if column in self.obs:
+                    del self.obs[column]
+            for column in (
+                "_normed_means",
+                "non_zero",
+                "_MoM_dispersions",
+                "genewise_dispersions",
+                "vst_genewise_dispersions",
+                "_genewise_converged",
+                "fitted_dispersions",
+                "MAP_dispersions",
+                "_MAP_converged",
+                "dispersions",
+                "_outlier_genes",
+                "_LFC_converged",
+                "replaced",
+                "refitted",
+                "_pvalue_cooks_outlier",
+            ):
+                if column in self.var:
+                    del self.var[column]
+            for layer in (
+                "normalization_factors",
+                "normed_counts",
+                "_mu_hat",
+                "_vst_mu_hat",
+                "vst_counts",
+                "cooks",
+                "replace_cooks",
+            ):
+                if layer in self.layers:
+                    del self.layers[layer]
+            for key in ("_mu_LFC", "_hat_diagonals"):
+                if key in self.obsm:
+                    del self.obsm[key]
+            if "LFC" in self.varm:
+                del self.varm["LFC"]
+            for key in (
+                "trend_coeffs",
+                "vst_trend_coeffs",
+                "mean_disp",
+                "disp_function_type",
+                "_squared_logres",
+                "prior_disp_var",
+            ):
+                if key in self.uns:
+                    del self.uns[key]
+
         self.min_mu = min_mu
         self.min_disp = min_disp
         self.max_disp = np.maximum(max_disp, self.n_obs)
@@ -517,6 +592,25 @@ class DeseqDataSet(ad.AnnData):
 
         # Initialize the inference object.
         self.inference = inference or DefaultInference(n_cpus=n_cpus)
+
+        if preserve_inherited_fit and adata is not None:
+            if "LFC" in self.varm:
+                self.varm["LFC"] = self.varm["LFC"].copy()
+
+            self._normalization_fit_type = adata._normalization_fit_type
+            self._normalization_control_mask = adata._normalization_control_mask.copy()
+
+            for attr in (
+                "non_zero_idx",
+                "non_zero_genes",
+                "counts_to_refit",
+                "new_all_zeroes_genes",
+            ):
+                if hasattr(adata, attr):
+                    setattr(self, attr, getattr(adata, attr).copy())
+
+            if hasattr(adata, "vst_fit_type"):
+                self.vst_fit_type = adata.vst_fit_type
 
     def _validate_transcript_lengths(self, transcript_lengths: np.ndarray) -> None:
         """Validate a sample-by-gene average transcript-length matrix."""
@@ -928,6 +1022,7 @@ class DeseqDataSet(ad.AnnData):
         # Otherwise mask all genes to be True
         else:
             _control_mask = np.ones(self.X.shape[1], dtype=bool)
+        normalization_control_mask = _control_mask.copy()
 
         if "avg_tx_length" not in self.layers and "normalization_factors" in self.layers:
             del self.layers["normalization_factors"]
@@ -977,7 +1072,7 @@ class DeseqDataSet(ad.AnnData):
 
         # Test whether it is possible to use median-of-ratios.
         elif (
-            (cast(Any, self.X).count_nonzero(axis=0) < self.n_obs).all()
+            (np.asarray((cast(Any, self.X) != 0).sum(axis=0)).ravel() < self.n_obs).all()
             if issparse(self.X)
             else (self.X == 0).any(0).all()
         ):
@@ -1008,6 +1103,8 @@ class DeseqDataSet(ad.AnnData):
 
         end = time.time()
         self.var["_normed_means"] = self.layers["normed_counts"].mean(axis=0)
+        self._normalization_fit_type = fit_type
+        self._normalization_control_mask = normalization_control_mask
 
         if not self.quiet:
             print(f"... done in {end - start:.2f} seconds.\n", file=sys.stderr)
@@ -1411,7 +1508,9 @@ class DeseqDataSet(ad.AnnData):
 
         pos = np.asarray(self.layers["cooks"][:, cooks_outlier].argmax(0)).ravel()
         for gene_idx, sample_idx in zip(np.flatnonzero(cooks_outlier), pos, strict=True):
-            gene_counts = self.X[:, gene_idx]
+            gene_counts = (
+                self.X[:, [gene_idx]] if issparse(self.X) else self.X[:, gene_idx]
+            )
             if hasattr(gene_counts, "toarray"):
                 gene_counts = gene_counts.toarray()
             gene_counts = np.asarray(gene_counts).ravel()
