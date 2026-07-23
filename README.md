@@ -13,8 +13,10 @@ It aims to facilitate DEA experiments for python users.
 As PyDESeq2 is a re-implementation of [DESeq2](https://bioconductor.org/packages/release/bioc/html/DESeq2.html) from
 scratch, you may experience some differences in terms of retrieved values or available features.
 
-Currently, available features broadly correspond to the default settings of DESeq2 (v1.34.0) for single-factor and
-multi-factor analysis (with categorical or continuous factors) using Wald tests.
+Currently, available features broadly correspond to the default settings of DESeq2
+(v1.34.0) for single- and multi-factor analyses with categorical or continuous
+factors. PyDESeq2 supports Wald tests and classical negative-binomial
+likelihood-ratio tests of nested models.
 We plan to implement more in the future.
 In case there is a feature you would particularly like to be implemented, feel free to open an issue.
 

@@ -46,6 +46,8 @@ def test_valid_counts(counts: pd.DataFrame | np.ndarray | spmatrix | sparray) ->
         raise ValueError("The count matrix should only contain integers.")
     if (counts < 0).any().any():
         raise ValueError("The count matrix should only contain non-negative values.")
+    if (counts >= 2**63).any().any():
+        raise ValueError("The count matrix values must fit in a signed 64-bit integer.")
 
 
 def n_or_more_replicates(design_matrix: pd.DataFrame, min_replicates: int) -> pd.Series:

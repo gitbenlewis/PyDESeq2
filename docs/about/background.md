@@ -11,7 +11,7 @@ PyDESeq2 {cite:p}`muzellec2023pydeseq2` reimplements that method in Python, on {
 Current features broadly correspond to the default settings of DESeq2 (v1.34.0):
 
 - single-factor and multi-factor analysis, with categorical or continuous factors
-- Wald tests, with Cooks filtering and independent filtering
+- Wald tests and classical likelihood-ratio tests comparing nested designs, with Cooks filtering and independent filtering
 - optional [apeGLM](https://academic.oup.com/bioinformatics/article/35/12/2084/5159452) log fold-change shrinkage {cite:p}`zhu2019heavy`
 - variance-stabilising transformation
 
