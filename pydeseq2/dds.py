@@ -38,11 +38,10 @@ def _rounded_counts(counts: Any) -> Any:
         return counts.round()
     if isinstance(counts, np.ndarray):
         return np.rint(counts)
-    sparse_counts = cast(Any, counts)
-    if sparse_counts.format in {"csr", "csc"}:
-        rounded = sparse_counts.copy()
+    if counts.format in {"csr", "csc"}:
+        rounded = counts.copy()
     else:
-        rounded = sparse_counts.tocsr()
+        rounded = counts.tocsr()
     rounded.sum_duplicates()
     rounded.data = np.rint(rounded.data)
     rounded.eliminate_zeros()
@@ -356,7 +355,6 @@ class DeseqDataSet(ad.AnnData):
                 )
                 self.uns.update(owned_uns)
             else:
-                # Preserve the existing AnnData initialization behavior.
                 self.__dict__.update(adata.__dict__)
                 # AnnData 0.13 stores X under the None layer key. Detach the
                 # container so assigning self.X does not modify the input AnnData.
@@ -465,12 +463,7 @@ class DeseqDataSet(ad.AnnData):
 
         if preserve_inherited_fit and adata is not None:
             source_design = adata.obsm.get("design_matrix")
-            normalization_control_mask = np.ones(self.n_vars, dtype=bool)
-            if control_genes is not None:
-                normalization_control_mask[:] = False
-                normalization_control_mask[
-                    self._normalize_indices((slice(None), control_genes))[1]
-                ] = True
+            normalization_control_mask = self._make_control_mask(control_genes)
             fit_settings = (
                 ("fit_type", fit_type),
                 ("min_mu", min_mu),
@@ -484,10 +477,7 @@ class DeseqDataSet(ad.AnnData):
                 isinstance(source_design, pd.DataFrame)
                 and cast(pd.DataFrame, self.obsm["design_matrix"]).equals(source_design)
                 and all(
-                    hasattr(adata, attr)
-                    and np.array_equal(
-                        np.asarray(getattr(adata, attr)), np.asarray(value)
-                    )
+                    hasattr(adata, attr) and np.array_equal(getattr(adata, attr), value)
                     for attr, value in fit_settings
                 )
                 and getattr(adata, "_normalization_fit_type", None)
@@ -497,24 +487,15 @@ class DeseqDataSet(ad.AnnData):
                     adata._normalization_control_mask,
                     normalization_control_mask,
                 )
+                and hasattr(adata, "inference")
                 and (
-                    (
-                        inference is None
-                        and hasattr(adata, "inference")
-                        and type(adata.inference) is DefaultInference
-                    )
-                    or (
-                        inference is not None
-                        and hasattr(adata, "inference")
-                        and inference is adata.inference
-                    )
+                    type(adata.inference) is DefaultInference
+                    if inference is None
+                    else inference is adata.inference
                 )
             )
 
-        invalidate_inherited_fit = (
-            adata is not None and has_transcript_lengths and not preserve_inherited_fit
-        )
-        if invalidate_inherited_fit:
+        if adata is not None and has_transcript_lengths and not preserve_inherited_fit:
             # Invalidate fitting state derived from copied normalization factors.
             for column in ("size_factors", "replaceable"):
                 if column in self.obs:
@@ -547,13 +528,10 @@ class DeseqDataSet(ad.AnnData):
                 "cooks",
                 "replace_cooks",
             ):
-                if layer in self.layers:
-                    del self.layers[layer]
+                self.layers.pop(layer, None)
             for key in ("_mu_LFC", "_hat_diagonals"):
-                if key in self.obsm:
-                    del self.obsm[key]
-            if "LFC" in self.varm:
-                del self.varm["LFC"]
+                self.obsm.pop(key, None)
+            self.varm.pop("LFC", None)
             for key in (
                 "trend_coeffs",
                 "vst_trend_coeffs",
@@ -562,8 +540,7 @@ class DeseqDataSet(ad.AnnData):
                 "_squared_logres",
                 "prior_disp_var",
             ):
-                if key in self.uns:
-                    del self.uns[key]
+                self.uns.pop(key, None)
 
         self.min_mu = min_mu
         self.min_disp = min_disp
@@ -624,10 +601,19 @@ class DeseqDataSet(ad.AnnData):
         if (transcript_lengths <= 0).any():
             raise ValueError("transcript_lengths must contain only positive values.")
 
-    def _get_normalization_factors(self) -> np.ndarray:
-        """Return gene-specific factors when present, otherwise sample size factors."""
+    def _make_control_mask(self, control_genes: Any) -> np.ndarray:
+        """Return a gene mask for the selected normalization controls."""
+        if control_genes is None:
+            return np.ones(self.n_vars, dtype=bool)
+        control_mask = np.zeros(self.n_vars, dtype=bool)
+        control_mask[self._normalize_indices((slice(None), control_genes))[1]] = True
+        return control_mask
+
+    def _get_normalization_factors(self, gene_idx: Any = None) -> np.ndarray:
+        """Return normalization factors, optionally restricted to genes."""
         if "normalization_factors" in self.layers:
-            return np.asarray(self.layers["normalization_factors"])
+            factors = np.asarray(self.layers["normalization_factors"])
+            return factors if gene_idx is None else factors[:, gene_idx]
         return self.obs["size_factors"].to_numpy()
 
     def _fit_transcript_length_factors(
@@ -636,9 +622,7 @@ class DeseqDataSet(ad.AnnData):
         control_mask: np.ndarray,
     ) -> None:
         """Fit DESeq2-style normalization factors from average transcript lengths."""
-        counts = np.asarray(
-            cast(Any, self.X).toarray() if hasattr(self.X, "toarray") else self.X
-        )
+        counts = cast(Any, self.X).toarray() if issparse(self.X) else np.asarray(self.X)
         transcript_lengths = np.asarray(self.layers["avg_tx_length"])
 
         # DESeq2 centers each gene's average transcript lengths around a geometric
@@ -1008,20 +992,7 @@ class DeseqDataSet(ad.AnnData):
                         " DeseqDataSet initialization"
                     )
 
-        # If control genes are provided, set a mask where those genes are True
-        # This will override self.control_genes
-        if control_genes is not None:
-            _control_mask: np.ndarray = np.zeros(self.X.shape[1], dtype=bool)
-
-            # Use AnnData internal indexing to get gene index array
-            # Allows bool/int/var_name to be provided
-            _control_mask[self._normalize_indices((slice(None), control_genes))[1]] = (
-                True
-            )
-
-        # Otherwise mask all genes to be True
-        else:
-            _control_mask = np.ones(self.X.shape[1], dtype=bool)
+        _control_mask = self._make_control_mask(control_genes)
         normalization_control_mask = _control_mask.copy()
 
         if "avg_tx_length" not in self.layers and "normalization_factors" in self.layers:
@@ -1137,9 +1108,7 @@ class DeseqDataSet(ad.AnnData):
 
         # Convert design_matrix to numpy for speed
         design_matrix = self.obsm["design_matrix"].values
-        size_factors = self._get_normalization_factors()
-        if size_factors.ndim == 2:
-            size_factors = size_factors[:, self.non_zero_idx]
+        size_factors = self._get_normalization_factors(self.non_zero_idx)
 
         # mu_hat is initialized differently depending on the number of different factor
         # groups. If there are as many different factor combinations as design factors
@@ -1353,9 +1322,7 @@ class DeseqDataSet(ad.AnnData):
         if not self.quiet:
             print("Fitting LFCs...", file=sys.stderr)
         start = time.time()
-        normalization_factors = self._get_normalization_factors()
-        if normalization_factors.ndim == 2:
-            normalization_factors = normalization_factors[:, self.non_zero_idx]
+        normalization_factors = self._get_normalization_factors(self.non_zero_idx)
         mle_lfcs_, mu_, hat_diagonals_, converged_ = self.inference.irls(
             counts=self.X[:, self.non_zero_idx],
             size_factors=normalization_factors,
@@ -1414,7 +1381,7 @@ class DeseqDataSet(ad.AnnData):
         counts = self.X[:, self.non_zero_idx]
         if hasattr(counts, "tocoo"):
             counts = counts.tocoo()
-            squared_pearson_res = -self.obsm["_mu_LFC"].copy()
+            squared_pearson_res = -self.obsm["_mu_LFC"]
             np.add.at(squared_pearson_res, (counts.row, counts.col), counts.data)
         else:
             squared_pearson_res = counts - self.obsm["_mu_LFC"]
@@ -1509,11 +1476,10 @@ class DeseqDataSet(ad.AnnData):
         pos = np.asarray(self.layers["cooks"][:, cooks_outlier].argmax(0)).ravel()
         for gene_idx, sample_idx in zip(np.flatnonzero(cooks_outlier), pos, strict=True):
             gene_counts = (
-                self.X[:, [gene_idx]] if issparse(self.X) else self.X[:, gene_idx]
+                cast(Any, self.X)[:, [gene_idx]].toarray().ravel()
+                if issparse(self.X)
+                else np.asarray(self.X[:, gene_idx]).ravel()
             )
-            if hasattr(gene_counts, "toarray"):
-                gene_counts = gene_counts.toarray()
-            gene_counts = np.asarray(gene_counts).ravel()
             cooks_outlier[gene_idx] = (gene_counts > gene_counts[sample_idx]).sum() < 3
 
         if self.low_memory:
@@ -1567,9 +1533,7 @@ class DeseqDataSet(ad.AnnData):
             normed_counts,
             self.obsm["design_matrix"].values,
         )
-        normalization_factors = self._get_normalization_factors()
-        if normalization_factors.ndim == 2:
-            normalization_factors = normalization_factors[:, self.non_zero_idx]
+        normalization_factors = self._get_normalization_factors(self.non_zero_idx)
         mde = self.inference.fit_moments_dispersions(
             normed_counts, normalization_factors
         )
@@ -1749,13 +1713,11 @@ class DeseqDataSet(ad.AnnData):
             self.counts_to_refit = self[:, self.var["replaced"]].copy()
             if hasattr(self.counts_to_refit.X, "toarray"):
                 self.counts_to_refit.X = self.counts_to_refit.X.toarray()
-            normalization_factors = self._get_normalization_factors()
+            normalization_factors = self._get_normalization_factors(
+                self.var["replaced"].to_numpy()
+            )
             if normalization_factors.ndim == 1:
                 normalization_factors = normalization_factors[:, None]
-            else:
-                normalization_factors = normalization_factors[
-                    :, self.var["replaced"].to_numpy()
-                ]
 
             trim_base_mean = np.asarray(
                 trimmed_mean(

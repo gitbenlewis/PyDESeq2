@@ -119,45 +119,27 @@ produce a compatible AnnData object directly:
 from pydeseq2.dds import DeseqDataSet
 from pytximport import tximport
 
-sample_files = {
-    "sample_1": "sample_1/quant.sf",
-    "sample_2": "sample_2/quant.sf",
-}
-
+sample_names = ["sample_1", "sample_2"]
 txi = tximport(
-    list(sample_files.values()),
+    [f"{sample}/quant.sf" for sample in sample_names],
     data_type="salmon",
     transcript_gene_map=transcript_gene_map,
     counts_from_abundance=None,
     output_type="anndata",
 )
-# pytximport uses file paths as observation names. Replace them with metadata
-# rows in the same explicit sample order.
-txi.obs = metadata.loc[list(sample_files)].copy()
-
+txi.obs = metadata.loc[sample_names].copy()
 dds = DeseqDataSet(adata=txi, design="~condition")
 dds.deseq2()
 ```
 
-Direct transcript-length normalization requires an in-memory AnnData object.
-For a backed object, call `adata.to_memory()` before constructing `DeseqDataSet`;
-this materializes the data, so ensure sufficient memory is available.
-
-Only unscaled estimated counts created with `counts_from_abundance=None` may be
-combined with transcript-length offsets. PyDESeq2 rejects abundance-derived modes
-such as `scaled_tpm` and `length_scaled_tpm`, because applying the offset would
-correct for transcript length twice.
-
-After the unscaled-count check succeeds, when multiple length sources are
-available, PyDESeq2 uses an explicit `transcript_lengths` argument first, then
-`adata.layers["avg_tx_length"]`, and finally compatible pytximport fields.
-Pytximport lengths are copied from
-`adata.obsm["length"]` into the canonical `avg_tx_length` layer.
-
-The current pytximport length matrix has no gene labels, and AnnData does not align
-its second `obsm` dimension with `adata.var`. Pass the object before gene-axis
-subsetting or reordering, or apply the same selection and ordering to
-`adata.obsm["length"]`.
+Use only unscaled estimated counts (`counts_from_abundance=None`); the file list and
+metadata rows must use the same sample order. For backed AnnData, call
+`adata.to_memory()` first and ensure sufficient memory. Length-source precedence is
+deterministic: explicit `transcript_lengths`, `adata.layers["avg_tx_length"]`, then
+compatible pytximport fields; PyDESeq2 copies `adata.obsm["length"]` into the canonical
+layer. Because that matrix has no gene labels and AnnData does not align its second
+`obsm` dimension with `adata.var`, pass it before gene-axis subsetting/reordering or
+apply the same selection and order to `adata.obsm["length"]`.
 
 Following the
 [`tximport`](https://bioconductor.org/packages/release/bioc/html/tximport.html) and

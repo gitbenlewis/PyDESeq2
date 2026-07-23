@@ -384,10 +384,7 @@ class DeseqStats:
 
         design_matrix = self.design_matrix.values
         size = 1.0 / self.dds.var["dispersions"].values
-        normalization_factors = self.dds._get_normalization_factors()
-        if normalization_factors.ndim == 2:
-            normalization_factors = normalization_factors[:, self.dds.non_zero_idx]
-        offset = np.log(normalization_factors)
+        offset = np.log(self.dds._get_normalization_factors(self.dds.non_zero_idx))
 
         # Set priors
         prior_no_shrink_scale = 15

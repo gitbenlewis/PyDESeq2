@@ -137,11 +137,7 @@ def test_valid_counts(
             raise ValueError("The count matrix should only contain numbers.")
         if np.isnan(values).any():
             raise ValueError("NaNs are not allowed in the count matrix.")
-        if (values % 1 != 0).any():
-            raise ValueError("The count matrix should only contain integers.")
-        if (values < 0).any():
-            raise ValueError("The count matrix should only contain non-negative values.")
-        return
+        counts = values
     else:
         if np.isnan(counts).any().any():
             raise ValueError("NaNs are not allowed in the count matrix.")
@@ -900,11 +896,9 @@ def fit_moments_dispersions(
     # Mean inverse size factor. For gene-specific normalization factors, DESeq2
     # first averages factors across genes within each sample, then averages the
     # inverse sample means into one scalar shared by all genes.
-    if size_factors.ndim == 1:
-        s_mean_inv = (1 / size_factors).mean()
-    else:
-        size_factors = size_factors[:, nonzero_genes]
-        s_mean_inv = (1 / size_factors.mean(axis=1)).mean()
+    if size_factors.ndim != 1:
+        size_factors = size_factors[:, nonzero_genes].mean(axis=1)
+    s_mean_inv = (1 / size_factors).mean()
     mu = normed_counts.mean(0)
     sigma = normed_counts.var(0, ddof=1)
     # ddof=1 is to use an unbiased estimator, as in R
