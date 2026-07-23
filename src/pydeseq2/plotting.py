@@ -78,7 +78,17 @@ def make_MA_plot(
     log: bool = True,
     save_path: str | None = None,
     lfc_null: float = 0,
-    alt_hypothesis: Literal["greaterAbs", "lessAbs", "greater", "less"] | None = None,
+    alt_hypothesis: (
+        Literal[
+            "greaterAbs",
+            "greaterAbs2014",
+            "greaterAbsUPSHOT",
+            "lessAbs",
+            "greater",
+            "less",
+        ]
+        | None
+    ) = None,
     **kwargs,
 ) -> None:
     """
@@ -129,7 +139,7 @@ def make_MA_plot(
     plt.ylabel("log2 fold change")
 
     plt.axhline(lfc_null, color="red", alpha=0.5, linestyle="--", zorder=3)
-    if alt_hypothesis and alt_hypothesis in ["greaterAbs", "lessAbs"]:
+    if alt_hypothesis in {"greaterAbs", "greaterAbs2014", "greaterAbsUPSHOT", "lessAbs"}:
         plt.axhline(-lfc_null, color="red", alpha=0.5, linestyle="--", zorder=3)
     plt.tight_layout()
 

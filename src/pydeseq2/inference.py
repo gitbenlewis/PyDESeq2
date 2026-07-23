@@ -165,9 +165,17 @@ class Inference(ABC):
         mu: np.ndarray,
         ridge_factor: np.ndarray,
         contrast: np.ndarray,
-        lfc_null: np.ndarray,
+        lfc_null: float,
         alt_hypothesis: (
-            Literal["greaterAbs", "lessAbs", "greater", "less"] | None
+            Literal[
+                "greaterAbs",
+                "greaterAbs2014",
+                "greaterAbsUPSHOT",
+                "lessAbs",
+                "greater",
+                "less",
+            ]
+            | None
         ) = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Run Wald test for differential expression.
@@ -189,7 +197,7 @@ class Inference(ABC):
         contrast
             Vector encoding the contrast that is being tested.
         lfc_null
-            The (log2) log fold change under the null hypothesis.
+            The log fold change under the null hypothesis, in natural log scale.
         alt_hypothesis
             The alternative hypothesis for computing wald p-values.
 
