@@ -19,11 +19,11 @@ from scipy.sparse import dok_matrix
 from scipy.sparse import lil_array
 from scipy.sparse import lil_matrix
 
+from pydeseq2.datasets import load_example_data
 from pydeseq2.dds import DeseqDataSet
 from pydeseq2.default_inference import DefaultInference
+from pydeseq2.dispersions import fit_moments_dispersions
 from pydeseq2.ds import DeseqStats
-from pydeseq2.utils import fit_moments_dispersions
-from pydeseq2.utils import load_example_data
 
 
 def small_tximport_data():

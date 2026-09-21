@@ -4,18 +4,15 @@ Step-by-step PyDESeq2 workflow
 
 This notebook details all the steps of the PyDESeq2 pipeline.
 
-It allows you to run the PyDESeq2 pipeline on the synthetic data provided
-in this repository.
+It allows you to run the PyDESeq2 pipeline on the synthetic data provided in this repository.
 
-If this is your first contact with PyDESeq2, we recommend you first have a look at the
-:doc:`standard workflow example <plot_minimal_pydeseq2_pipeline>`.
+If this is your first contact with PyDESeq2, we recommend you first have a look at the :doc:`standard workflow example <plot_minimal_pydeseq2_pipeline>`.
 
 .. contents:: Contents
     :local:
     :depth: 3
 
-We start by importing required packages and setting up an optional path to save
-results.
+We start by importing required packages and setting up an optional path to save results.
 """
 
 import os
@@ -23,10 +20,10 @@ import pickle as pkl
 
 import numpy as np
 
+from pydeseq2.datasets import load_example_data
 from pydeseq2.dds import DeseqDataSet
 from pydeseq2.default_inference import DefaultInference
 from pydeseq2.ds import DeseqStats
-from pydeseq2.utils import load_example_data
 
 SAVE = False  # whether to save the outputs of this notebook
 
@@ -57,7 +54,7 @@ if SAVE:
 #
 # To illustrate the required data format, we load a synthetic example dataset
 # that may be
-# obtained through PyDESeq2's API using :func:`utils.load_example_data`.
+# obtained through PyDESeq2's API using :func:`datasets.load_example_data`.
 # You may replace it with your own dataset.
 
 counts_df = load_example_data(
