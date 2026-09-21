@@ -430,9 +430,7 @@ def test_new_all_zero_gene():
         refit_cooks=True,
     )
 
-    with pytest.warns(UserWarning):
-        # Will warn that parametric trend fit failed
-        dds.deseq2()
+    dds.deseq2()
 
     ds = DeseqStats(dds, contrast=["condition", "B", "A"])
     ds.summary()

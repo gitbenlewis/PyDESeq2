@@ -1550,46 +1550,39 @@ class DeseqDataSet(ad.AnnData):
             index=self.non_zero_genes,
         )
 
-        for gene in self.non_zero_genes:
-            if (
-                np.isinf(covariates.loc[gene]).any()
-                or np.isnan(covariates.loc[gene]).any()
-            ):
-                targets.drop(labels=[gene], inplace=True)
-                covariates.drop(labels=[gene], inplace=True)
+        # DESeq2 excludes near-minimum dispersions before fitting the trend.
+        eligible = np.isfinite(covariates) & (targets > 100 * self.min_disp)
+        targets = targets[eligible]
+        covariates = covariates[eligible]
 
-        # Initialize coefficients
-        old_coeffs: np.ndarray | pd.Series = pd.Series([0.1, 0.1])
-        coeffs: np.ndarray | pd.Series = pd.Series([1.0, 1.0])
-        while (coeffs > 1e-10).all() and (
-            np.log(np.abs(coeffs / old_coeffs)) ** 2
-        ).sum() >= 1e-6:
+        coeffs = np.array([0.1, 1.0])
+        converged = False
+        for _ in range(11):
+            # Reconsider all eligible genes each iteration: a gene excluded by the
+            # initial curve can be compatible with a later fitted curve.
+            pred_ratios = targets / (coeffs[0] + coeffs[1] * covariates)
+            good = (pred_ratios > 1e-4) & (pred_ratios < 15)
+            if not good.any():
+                break
             old_coeffs = coeffs
-            coeffs, predictions, converged = self.inference.dispersion_trend_gamma_glm(
-                covariates, targets
+            coeffs, _, success = self.inference.dispersion_trend_gamma_glm(
+                covariates[good], targets[good]
             )
-            if not converged or (coeffs <= 1e-10).any():
-                warnings.warn(
-                    "The dispersion trend curve fitting did not converge. "
-                    "Switching to a mean-based dispersion trend.",
-                    UserWarning,
-                    stacklevel=2,
-                )
+            if not success or not np.isfinite(coeffs).all() or (coeffs <= 1e-10).any():
+                break
+            if (np.log(coeffs / old_coeffs) ** 2).sum() < 1e-6:
+                converged = True
+                break
 
-                self._fit_mean_dispersion_trend(vst)
-                return
-
-            # Filter out genes that are too far away from the curve before refitting
-            pred_ratios = self.var.loc[covariates.index, disp_param_name] / predictions
-
-            targets.drop(
-                targets[(pred_ratios < 1e-4) | (pred_ratios >= 15)].index,
-                inplace=True,
+        if not converged:
+            warnings.warn(
+                "The dispersion trend curve fitting did not converge. "
+                "Switching to a mean-based dispersion trend.",
+                UserWarning,
+                stacklevel=2,
             )
-            covariates.drop(
-                covariates[(pred_ratios < 1e-4) | (pred_ratios >= 15)].index,
-                inplace=True,
-            )
+            self._fit_mean_dispersion_trend(vst)
+            return
 
         if vst:
             self.uns["vst_trend_coeffs"] = pd.Series(coeffs, index=["a0", "a1"])

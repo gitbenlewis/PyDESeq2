@@ -287,6 +287,9 @@ class DeseqStats:
             normalization_factors = normalization_factors[:, None]
         mu = np.exp(self.design_matrix @ self.LFC.T).to_numpy() * normalization_factors
 
+        # Match the mean floor used when fitting the GLM and its covariance.
+        mu = np.maximum(mu, self.dds.min_mu)
+
         # Set regularization factors.
         if self.prior_LFC_var is not None:
             ridge_factor = np.diag(1 / self.prior_LFC_var**2)
