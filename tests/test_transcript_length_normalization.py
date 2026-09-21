@@ -242,6 +242,27 @@ def test_transcript_lengths_must_be_positive_and_finite(length_source, bad_value
         DeseqDataSet(**kwargs)
 
 
+@pytest.mark.parametrize(
+    ("zero_rows", "message"),
+    [
+        (slice(None), "No genes are available"),
+        (0, "At least one sample has no positive counts"),
+    ],
+)
+def test_transcript_length_normalization_rejects_unusable_counts(zero_rows, message):
+    counts, metadata, transcript_lengths = small_tximport_data()
+    counts.iloc[zero_rows, :] = 0
+    dds = DeseqDataSet(
+        counts=counts,
+        metadata=metadata,
+        transcript_lengths=transcript_lengths,
+        quiet=True,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        dds.fit_size_factors("poscounts")
+
+
 def test_transcript_length_labels_must_match_counts():
     counts, metadata, transcript_lengths = small_tximport_data()
     transcript_lengths = transcript_lengths.rename(index={"sample1": "wrong_sample"})

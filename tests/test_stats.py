@@ -96,7 +96,12 @@ def test_valid_dia_counts_ignore_padding(sparse_constructor):
 
 @pytest.mark.parametrize(
     ("value", "message"),
-    [(np.nan, "NaNs"), (1.5, "integers"), (-1, "non-negative")],
+    [
+        (np.nan, "NaNs"),
+        (1.5, "integers"),
+        (-1, "non-negative"),
+        (True, "only contain numbers"),
+    ],
 )
 def test_invalid_general_sparse_counts(value, message):
     with pytest.raises(ValueError, match=message):
